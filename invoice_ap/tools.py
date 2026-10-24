@@ -4,10 +4,12 @@ Validation uses these directly, and the approver agent is given the same
 functions as tools, so it can verify claims instead of trusting a summary.
 """
 
+import datetime as dt
 import difflib
 import json
 import sqlite3
 
+from .config import SETTINGS
 from .normalize import item_key, vendor_key
 
 
@@ -58,6 +60,31 @@ def get_invoice_history(conn: sqlite3.Connection, invoice_number: str | None) ->
         (invoice_number,),
     )
     return [dict(r) for r in rows]
+
+
+def get_vendor_history(
+    conn: sqlite3.Connection, vendor: str, days: int = 30, as_of: dt.date | None = None
+) -> dict:
+    """Recent ledger invoices from a vendor, newest first. Lets the approver test
+    split billing: sibling invoices whose sum crosses an approval threshold."""
+    as_of = as_of or SETTINGS.as_of_date
+    cutoff = as_of - dt.timedelta(days=days)
+    recent = []
+    for row in conn.execute("SELECT invoice_number, vendor, total, status, invoice_json "
+                            "FROM invoices_processed ORDER BY id DESC"):
+        if vendor_key(row["vendor"] or "") != vendor_key(vendor):
+            continue
+        invoice_date = None
+        if row["invoice_json"]:
+            raw = json.loads(row["invoice_json"]).get("date")
+            invoice_date = dt.date.fromisoformat(raw) if raw else None
+        if invoice_date is None or invoice_date >= cutoff:
+            recent.append({"invoice_number": row["invoice_number"],
+                           "invoice_date": str(invoice_date) if invoice_date else None,
+                           "total": row["total"], "status": row["status"]})
+    return {"vendor": vendor, "window_days": days, "as_of": str(as_of),
+            "count": len(recent), "combined_total": round(sum(r["total"] or 0 for r in recent), 2),
+            "invoices": recent[:20]}
 
 
 def committed_quantities(conn: sqlite3.Connection) -> dict[str, float]:

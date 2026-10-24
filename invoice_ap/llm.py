@@ -104,12 +104,41 @@ def brief_error(exc: Exception, limit: int = 140) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def clean_schema(node):
+    """Strip schema noise (title, default) that providers' tool-schema validators
+    do not document, keeping everything meaningful. Property *names* such as a
+    field called 'title' are preserved."""
+    if isinstance(node, list):
+        return [clean_schema(n) for n in node]
+    if not isinstance(node, dict):
+        return node
+    out = {}
+    for key, value in node.items():
+        if key in ("title", "default"):
+            continue
+        if key in ("properties", "$defs"):
+            out[key] = {name: clean_schema(sub) for name, sub in value.items()}
+        else:
+            out[key] = clean_schema(value)
+    return out
+
+
+SUBMIT_DESCRIPTION = "Submit your final answer. Call this exactly once when done."
+
+
 class OpenAICompatibleProvider:
-    """Tool-calling loop over any OpenAI-compatible chat completions API."""
+    """Tool-calling loop over an OpenAI-compatible API.
+
+    Two wire formats are supported: the Responses API (`api = "responses"`) and
+    chat completions (`api = "chat"`). Both run the same loop: the model may call
+    read-only tools, then must call `submit` with an object that validates
+    against the schema; invalid submissions are sent back for correction."""
 
     name = "openai-compatible"
     is_mock = False
     MAX_TURNS = 8
+    api = "chat"
+    fallback_to_chat = False  # on a 404 from the Responses endpoint, switch to chat
 
     default_models: dict[str, str] = {}
     model_hint = "set AP_MODEL_<ROLE>"
@@ -124,84 +153,44 @@ class OpenAICompatibleProvider:
             raise LLMError(f"no model configured for role '{role}': {self.model_hint}")
         return model
 
-    def _create(self, **kwargs):
+    def _call(self, fn, **kwargs):
         """Temperature 0 for repeatability. Some reasoning models reject the
         parameter, so retry once without it rather than fail the invoice."""
         temperature = os.environ.get("AP_TEMPERATURE", "0")
         if temperature:
             kwargs["temperature"] = float(temperature)
         try:
-            return self.client.chat.completions.create(**kwargs)
+            return fn(**kwargs)
         except Exception as exc:
             if "temperature" in kwargs and "temperature" in str(exc).lower():
                 kwargs.pop("temperature")
-                return self.client.chat.completions.create(**kwargs)
+                return fn(**kwargs)
             raise
+
+    @staticmethod
+    def _run_tool(by_name: dict, name: str, args: dict, record: Usage) -> str:
+        record.tool_calls += 1
+        tool = by_name.get(name)
+        try:
+            if tool is None:
+                raise KeyError(f"unknown tool {name}")
+            return json.dumps(tool.fn(**args), default=str)
+        except Exception as exc:  # tool errors go back to the model
+            return f"Tool error: {exc}"
 
     def structured(self, *, role, system, user, schema, tools=(), context=None):
         model = self.model_for(role)
         record = Usage(role=role, model=model)
         started = time.perf_counter()
-        specs = [
-            {"type": "function", "function": {
-                "name": t.name, "description": t.description, "parameters": t.input_schema}}
-            for t in tools
-        ]
-        specs.append({"type": "function", "function": {
-            "name": "submit",
-            "description": "Submit your final answer. Call this exactly once when done.",
-            "parameters": schema.model_json_schema()}})
-        by_name = {t.name: t for t in tools}
-        messages: list[dict] = [{"role": "system", "content": system},
-                                {"role": "user", "content": user}]
         try:
-            for _ in range(self.MAX_TURNS):
-                response = self._create(model=model, messages=messages, tools=specs,
-                                        tool_choice="auto")
-                if response.usage:
-                    record.input_tokens += response.usage.prompt_tokens or 0
-                    record.output_tokens += response.usage.completion_tokens or 0
-                message = response.choices[0].message
-                calls = message.tool_calls or []
-                messages.append({
-                    "role": "assistant", "content": message.content or "",
-                    **({"tool_calls": [
-                        {"id": c.id, "type": "function",
-                         "function": {"name": c.function.name, "arguments": c.function.arguments}}
-                        for c in calls]} if calls else {}),
-                })
-                submitted = None
-                for call in calls:
-                    try:
-                        args = json.loads(call.function.arguments or "{}")
-                    except json.JSONDecodeError as exc:
-                        messages.append({"role": "tool", "tool_call_id": call.id,
-                                         "content": f"Arguments were not valid JSON: {exc}"})
-                        continue
-                    if call.function.name == "submit":
-                        try:
-                            submitted = schema.model_validate(args)
-                            messages.append({"role": "tool", "tool_call_id": call.id,
-                                             "content": "ok"})
-                        except ValidationError as exc:
-                            messages.append({"role": "tool", "tool_call_id": call.id,
-                                             "content": f"Invalid submission, fix and resubmit: {exc}"})
-                        continue
-                    record.tool_calls += 1
-                    tool = by_name.get(call.function.name)
-                    try:
-                        if tool is None:
-                            raise KeyError(f"unknown tool {call.function.name}")
-                        content = json.dumps(tool.fn(**args), default=str)
-                    except Exception as exc:  # tool errors go back to the model
-                        content = f"Tool error: {exc}"
-                    messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
-                if submitted is not None:
-                    return submitted
-                if not calls:  # model answered in prose without submitting
-                    messages.append({"role": "user",
-                                     "content": "Call the submit tool with your answer."})
-            raise LLMError(f"{role}: no valid submission after {self.MAX_TURNS} turns")
+            try:
+                return self._dispatch(model, record, system, user, schema, tools)
+            except Exception as exc:
+                if (self.api == "responses" and self.fallback_to_chat
+                        and getattr(exc, "status_code", None) in (404, 405)):
+                    self.api = "chat"  # this endpoint is not available: stay on chat
+                    return self._dispatch(model, record, system, user, schema, tools)
+                raise
         except LLMError:
             raise
         except Exception as exc:
@@ -210,9 +199,111 @@ class OpenAICompatibleProvider:
             record.latency_ms = (time.perf_counter() - started) * 1000
             self.usage.append(record)
 
+    def _dispatch(self, model, record, system, user, schema, tools):
+        run = self._run_responses if self.api == "responses" else self._run_chat
+        return run(model, record, system, user, schema, tools)
+
+    # -- chat completions ------------------------------------------------------------
+
+    def _run_chat(self, model, record, system, user, schema, tools):
+        specs = [{"type": "function", "function": {
+            "name": t.name, "description": t.description,
+            "parameters": clean_schema(t.input_schema)}} for t in tools]
+        specs.append({"type": "function", "function": {
+            "name": "submit", "description": SUBMIT_DESCRIPTION,
+            "parameters": clean_schema(schema.model_json_schema())}})
+        by_name = {t.name: t for t in tools}
+        messages: list[dict] = [{"role": "system", "content": system},
+                                {"role": "user", "content": user}]
+        for _ in range(self.MAX_TURNS):
+            response = self._call(self.client.chat.completions.create, model=model,
+                                  messages=messages, tools=specs, tool_choice="auto")
+            if response.usage:
+                record.input_tokens += response.usage.prompt_tokens or 0
+                record.output_tokens += response.usage.completion_tokens or 0
+            message = response.choices[0].message
+            calls = message.tool_calls or []
+            messages.append({
+                "role": "assistant", "content": message.content or "",
+                **({"tool_calls": [
+                    {"id": c.id, "type": "function",
+                     "function": {"name": c.function.name, "arguments": c.function.arguments}}
+                    for c in calls]} if calls else {}),
+            })
+            submitted = None
+            for call in calls:
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError as exc:
+                    messages.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": f"Arguments were not valid JSON: {exc}"})
+                    continue
+                if call.function.name == "submit":
+                    try:
+                        submitted = schema.model_validate(args)
+                        content = "ok"
+                    except ValidationError as exc:
+                        content = f"Invalid submission, fix and resubmit: {exc}"
+                else:
+                    content = self._run_tool(by_name, call.function.name, args, record)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
+            if submitted is not None:
+                return submitted
+            if not calls:  # model answered in prose without submitting
+                messages.append({"role": "user", "content": "Call the submit tool with your answer."})
+        raise LLMError(f"no valid submission after {self.MAX_TURNS} turns")
+
+    # -- Responses API ---------------------------------------------------------------
+
+    def _run_responses(self, model, record, system, user, schema, tools):
+        specs = [{"type": "function", "name": t.name, "description": t.description,
+                  "parameters": clean_schema(t.input_schema)} for t in tools]
+        specs.append({"type": "function", "name": "submit", "description": SUBMIT_DESCRIPTION,
+                      "parameters": clean_schema(schema.model_json_schema())})
+        by_name = {t.name: t for t in tools}
+        items: list[dict] = [{"role": "user", "content": user}]
+        previous_id = None
+        for _ in range(self.MAX_TURNS):
+            extra = {"previous_response_id": previous_id} if previous_id else {}
+            response = self._call(self.client.responses.create, model=model, instructions=system,
+                                  input=items, tools=specs, tool_choice="auto", **extra)
+            if getattr(response, "usage", None):
+                record.input_tokens += response.usage.input_tokens or 0
+                record.output_tokens += response.usage.output_tokens or 0
+            calls = [i for i in response.output if getattr(i, "type", None) == "function_call"]
+            results, submitted = [], None
+            for call in calls:
+                try:
+                    args = json.loads(call.arguments or "{}")
+                except json.JSONDecodeError as exc:
+                    results.append({"type": "function_call_output", "call_id": call.call_id,
+                                    "output": f"Arguments were not valid JSON: {exc}"})
+                    continue
+                if call.name == "submit":
+                    try:
+                        submitted = schema.model_validate(args)
+                        output = "ok"
+                    except ValidationError as exc:
+                        output = f"Invalid submission, fix and resubmit: {exc}"
+                else:
+                    output = self._run_tool(by_name, call.name, args, record)
+                results.append({"type": "function_call_output", "call_id": call.call_id,
+                                "output": output})
+            if submitted is not None:
+                return submitted
+            previous_id = response.id
+            items = results or [{"role": "user",
+                                 "content": "Call the submit tool with your answer."}]
+        raise LLMError(f"no valid submission after {self.MAX_TURNS} turns")
+
 
 class GrokProvider(OpenAICompatibleProvider):
+    """xAI Grok. Uses the Responses API, which xAI's current docs describe, and
+    falls back to chat completions if that endpoint is unavailable. Force one
+    with GROK_API=responses|chat."""
+
     name = "grok"
+    fallback_to_chat = True
     default_models = GROK_MODELS
     model_hint = "set AP_MODEL_<ROLE> (e.g. AP_MODEL_APPROVER=grok-4.7)"
 
@@ -227,6 +318,11 @@ class GrokProvider(OpenAICompatibleProvider):
                 timeout=60.0,
             )
         super().__init__(client)
+        choice = os.environ.get("GROK_API", "responses").lower()
+        if choice not in ("responses", "chat"):
+            raise ValueError("GROK_API must be 'responses' or 'chat'")
+        self.api = choice
+        self.fallback_to_chat = choice == "responses"
 
 
 class AnthropicProvider:

@@ -1,4 +1,4 @@
 Invoice Number,Vendor,Date,Due Date,Item,Qty,Unit Price,Line Total
-INV-2019,Widgets Inc.,03/04/2026,05/20/2026,SteelBracket,10,45.00,450.00
-,,,,,,Subtotal:,450.00
-,,,,,,Total:,450.00
+INV-2019,Widgets Inc.,01/02/2026,02/20/2026,SteelBracket,11,45.00,495.00
+,,,,,,Subtotal:,495.00
+,,,,,,Total:,495.00

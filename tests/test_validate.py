@@ -172,3 +172,50 @@ def test_disputable_markers(conn, load):
     assert by_code["UNKNOWN_ITEM"].disputable
     by_code = {f.code: f for f in validate(load("invoice_1009.json"), conn)}
     assert not by_code["NON_POSITIVE_TOTAL"].disputable
+
+
+# --- rebill and future-dated -------------------------------------------------------
+
+
+def test_same_bill_under_a_new_number_is_flagged_as_a_possible_rebill(conn, make):
+    record(conn, "r1", make(invoice_number="INV-9500"), Outcome.PAID, [])
+    again = make(invoice_number="INV-9501")  # same vendor, items and total
+    codes = {f.code for f in validate(again, conn)}
+    assert "POSSIBLE_REBILL" in codes
+
+
+def test_different_content_is_not_a_rebill(conn, make):
+    record(conn, "r1", make(invoice_number="INV-9500"), Outcome.PAID, [])
+    other = make(invoice_number="INV-9501", line_items=[
+        LineItem(item="WidgetA", quantity=5, unit_price=250.0, amount=1250.0)],
+        subtotal=1250.0, total=1250.0)
+    assert "POSSIBLE_REBILL" not in {f.code for f in validate(other, conn)}
+
+
+def test_a_rebill_is_escalated_by_the_floor_before_any_model_is_asked(conn, make):
+    from invoice_ap.policy import rule_floor
+    from invoice_ap.models import Decision
+
+    record(conn, "r1", make(invoice_number="INV-9500"), Outcome.PAID, [])
+    inv = make(invoice_number="INV-9501")
+    assert rule_floor(inv, validate(inv, conn)).decision == Decision.ESCALATE
+
+
+def test_future_dated_invoice_is_flagged(conn, make):
+    assert "FUTURE_DATED" in {f.code for f in validate(make(date="2026-03-15", due_date="2026-04-14"), conn)}
+    assert "FUTURE_DATED" not in {f.code for f in validate(make(date="2026-02-01"), conn)}
+
+
+# --- vendor history tool -----------------------------------------------------------
+
+
+def test_vendor_history_sums_recent_invoices_and_respects_the_window(conn, make):
+    from invoice_ap.tools import get_vendor_history
+
+    record(conn, "r1", make(invoice_number="INV-9600", date="2026-01-20", total=9990.0), Outcome.PAID, [])
+    record(conn, "r1", make(invoice_number="INV-9601", date="2025-11-01", total=500.0), Outcome.PAID, [])
+    record(conn, "r1", make(invoice_number="INV-9602", vendor="Someone Else", total=700.0), Outcome.PAID, [])
+    history = get_vendor_history(conn, "WIDGETS INC", days=30)
+    assert [i["invoice_number"] for i in history["invoices"]] == ["INV-9600"]  # window + vendor match
+    assert history["combined_total"] == 9990.0 and history["count"] == 1
+    assert get_vendor_history(conn, "Widgets Inc.", days=200)["count"] == 2

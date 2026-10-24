@@ -24,6 +24,18 @@ def content_hash(inv: Invoice) -> str:
     return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()[:16]
 
 
+def rebill_key(inv: Invoice) -> tuple:
+    """Everything that makes two invoices the same bill except the invoice
+    number and dates: a repeat under a new number is a classic duplicate payment."""
+    return (
+        vendor_key(inv.vendor or ""),
+        inv.currency,
+        round(inv.total, 2) if inv.total is not None else None,
+        tuple(sorted((item_key(li.item), li.quantity, round(li.unit_price or 0, 2))
+                     for li in inv.line_items)),
+    )
+
+
 def record(
     conn: sqlite3.Connection,
     run_id: str,

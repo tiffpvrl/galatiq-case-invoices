@@ -33,6 +33,8 @@ Hard fails reject immediately with an explanation. Flags pass forward as evidenc
 | Revised invoice (same number and vendor, different content) | Human review | Revisions are rare and risky, so automating them saves little and risks a lot. Show the delta and the original's status (INV-1004 / revised) |
 | Vendor matches only a former name or alias (INV-1012: "formerly FastShip Ltd.") | Flag | Needs confirmation and a vendor-master update; also an impersonation vector |
 | Same invoice number, different vendor | Flag | ID collision or fraud |
+| Same vendor, items and total as an earlier invoice under a different number | Flag, always escalated | Duplicate billing under a new number is a classic AP loss; the duplicate check keys on the number, so this needs its own check |
+| Invoice dated after the as-of date | Flag | Work cannot be billed before it exists; left to the approver because a one-day lead can be a timezone artifact |
 | Unit price deviates from catalog beyond tolerance | Flag | Price drift is often legitimate (discounts, e.g. INV-1013 volume discount) |
 | Unknown or unapproved vendor | Flag | New vendors are legitimate sometimes, but are the entry point for vendor-impersonation fraud |
 | Line math or total does not reconcile | Flag | Could be tax, freight or an extraction error |
@@ -110,3 +112,7 @@ Caveat: most cost and exception figures come from vendor blogs with commercial i
 - [2025 AFP Payments Fraud and Control Survey highlights (Truist)](https://truist.com/content/dam/truist-bank/us/en/documents/info/cci/2025-afp-payments-fraud-control-survey-report-key-highlights.pdf)
 - [AFP press release: 79% of organizations were victims of payments fraud in 2024](https://www.financialprofessionals.org/about/learn-more/press-releases/Details/survey-79-percent-of-organizations-were-victims-of-attempted-or-actual-payments-fraud-activity-in-2024)
 - [ACFE 2020 Report to the Nations summary (Withum)](https://www.withum.com/resources/2020-report-to-the-nations-insights-and-lessons-on-occupational-fraud/)
+
+## 5. Evidence from running the system
+
+See [eval-anthropic.md](eval-anthropic.md) for the model evaluation: the labeled judgment cases rerun five times each on a live model. Two design gaps (the approver having no way to check a vendor's other invoices, and the critic not seeing the approver's lookups) were found by reading the critic's objections in an earlier run and fixed before the final numbers.

@@ -1,0 +1,20 @@
+{
+  "invoice_number": "INV-2032",
+  "vendor": {
+    "name": "Atlas Industrial Supply"
+  },
+  "date": "2026-01-22",
+  "due_date": "2026-02-21",
+  "line_items": [
+    {
+      "item": "SteelBracket",
+      "quantity": 215,
+      "unit_price": 45.0
+    }
+  ],
+  "subtotal": 9675.0,
+  "tax_amount": 0.0,
+  "total": 9675.0,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}

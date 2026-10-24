@@ -13,7 +13,7 @@ import sqlite3
 from collections import defaultdict
 
 from .config import SETTINGS, Settings
-from .ledger import content_hash
+from .ledger import content_hash, rebill_key
 from .models import Finding, Invoice, Severity
 from .normalize import is_relative_date, item_key, vendor_key
 from .tools import (
@@ -66,6 +66,26 @@ def check_duplicate(inv: Invoice, conn: sqlite3.Connection) -> list[Finding]:
                 f"({prior['vendor']}).",
             ))
     return findings
+
+
+def check_rebill(inv: Invoice, conn: sqlite3.Connection) -> list[Finding]:
+    """The same bill (vendor, items, total) already processed under a different
+    invoice number."""
+    if inv.total is None or not inv.line_items:
+        return []
+    key = rebill_key(inv)
+    rows = conn.execute(
+        "SELECT invoice_number, invoice_json, status FROM invoices_processed "
+        "WHERE total = ? AND COALESCE(invoice_number, '') != COALESCE(?, '')",
+        (inv.total, inv.invoice_number),
+    )
+    for row in rows:
+        if row["invoice_json"] and rebill_key(Invoice.model_validate_json(row["invoice_json"])) == key:
+            return [_f("POSSIBLE_REBILL", Severity.WARNING,
+                       f"Same vendor, items and total as {row['invoice_number']} "
+                       f"({row['status']}) under a different invoice number: possible "
+                       "duplicate billing.")]
+    return []
 
 
 def _completeness(inv: Invoice) -> list[Finding]:
@@ -258,6 +278,9 @@ def _dates_and_terms(inv: Invoice, settings: Settings) -> list[Finding]:
         elif due == inv.date:
             out.append(_f("DUE_ON_ISSUE", Severity.WARNING,
                           "Due on the invoice date: no time for review."))
+    if inv.date and inv.date > settings.as_of_date:
+        out.append(_f("FUTURE_DATED", Severity.WARNING,
+                      f"Invoice date {inv.date} is after the as-of date {settings.as_of_date}."))
     if due and due < settings.as_of_date:
         out.append(_f("PAST_DUE", Severity.WARNING,
                       f"Due date {due} is before the as-of date {settings.as_of_date}."))
@@ -307,6 +330,7 @@ def validate(
     """Run every check and return all findings, most severe first."""
     findings = (
         check_duplicate(inv, conn)
+        + check_rebill(inv, conn)
         + _completeness(inv)
         + _lines(inv)
         + _arithmetic(inv, settings.policy.arithmetic_tolerance)

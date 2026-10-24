@@ -1,0 +1,21 @@
+{
+  "invoice_number": "INV-2030",
+  "vendor": {
+    "name": "Widgets Inc."
+  },
+  "date": "2026-01-20",
+  "due_date": "2026-02-20",
+  "line_items": [
+    {
+      "item": "WidgetA",
+      "quantity": 4,
+      "unit_price": 287.5
+    }
+  ],
+  "subtotal": 1150.0,
+  "tax_amount": 0.0,
+  "total": 1150.0,
+  "currency": "USD",
+  "payment_terms": "Net 30",
+  "notes": "Price per contract amendment CA-77, effective January."
+}

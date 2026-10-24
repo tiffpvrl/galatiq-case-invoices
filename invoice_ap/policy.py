@@ -20,6 +20,7 @@ FORCE_ESCALATE = {
     "UNKNOWN_VENDOR": "Vendor is not in the approved vendor master",
     "VENDOR_RENAMED": "Vendor master must be updated before paying a renamed vendor",
     "INVOICE_NUMBER_COLLISION": "Invoice number already used by a different vendor",
+    "POSSIBLE_REBILL": "Same bill already processed under another number: duplicate-payment risk",
     "REVISION_OF_PRIOR": "Revisions need human confirmation against the original",
     "NON_SETTLEABLE_CURRENCY": "Treasury must book an FX rate",
 }

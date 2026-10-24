@@ -185,7 +185,12 @@ def test_parser_failure_falls_back_to_the_llm(tmp_path):
     assert "parser failed" in p.calls[0][1]
 
 
-# --- Grok provider tool-use loop (fake client, no network) ---------------------------
+@pytest.fixture
+def chat_api(monkeypatch):
+    monkeypatch.setenv("GROK_API", "chat")
+
+
+# --- Grok provider, chat-completions mode (fake client, no network) ---------------------------
 
 
 class FakeCompletions:
@@ -217,7 +222,7 @@ def reply(*calls, content="", tokens=(10, 5)):
                            usage=SimpleNamespace(prompt_tokens=tokens[0], completion_tokens=tokens[1]))
 
 
-def test_grok_provider_runs_tools_then_returns_the_submission():
+def test_grok_provider_runs_tools_then_returns_the_submission(chat_api):
     from invoice_ap.llm import Tool
 
     calls = []
@@ -240,7 +245,7 @@ def test_grok_provider_runs_tools_then_returns_the_submission():
         "role": "tool", "tool_call_id": "1", "content": '{"ok": true}'}
 
 
-def test_grok_provider_asks_the_model_to_fix_an_invalid_submission():
+def test_grok_provider_asks_the_model_to_fix_an_invalid_submission(chat_api):
     client, completions = fake_client([
         reply(call("1", "submit", decision="MAYBE", rationale="x")),
         reply(call("2", "submit", decision="ESCALATE", rationale="x")),
@@ -251,7 +256,7 @@ def test_grok_provider_asks_the_model_to_fix_an_invalid_submission():
     assert "Invalid submission" in completions.requests[1]["messages"][-1]["content"]
 
 
-def test_grok_provider_retries_without_temperature_if_the_model_rejects_it():
+def test_grok_provider_retries_without_temperature_if_the_model_rejects_it(chat_api):
     client, completions = fake_client([
         ValueError("Unsupported parameter: temperature"),
         reply(call("1", "submit", decision="ESCALATE", rationale="x")),
@@ -269,7 +274,7 @@ def test_grok_provider_wraps_failures_as_llm_error():
             role="approver", system="s", user="u", schema=ApproverVerdict)
 
 
-def test_grok_provider_nudges_then_gives_up_when_the_model_never_submits():
+def test_grok_provider_nudges_then_gives_up_when_the_model_never_submits(chat_api):
     client, completions = fake_client([reply(content="hi")] * 8)
     with pytest.raises(LLMError):
         GrokProvider(client=client).structured(
@@ -444,3 +449,20 @@ def test_a_malformed_file_fully_recovered_by_the_fallback_is_accepted(tmp_path):
     broken.write_text(DOC.read_text())  # complete invoice text with the wrong extension
     p = Scripted(extractor=[extraction()])
     assert ingest(broken, p, SETTINGS).method == "llm-fallback"
+
+
+def test_the_critic_is_shown_the_approvers_actual_lookup_results(inv, conn):
+    """Otherwise it can only call the approver's cited facts 'unverified'."""
+
+    class ApproverThatLooksThingsUp(Scripted):
+        def structured(self, *, role, tools=(), **kw):
+            if role == "approver":
+                next(t for t in tools if t.name == "get_vendor_history").fn(vendor="Widgets Inc.")
+            return super().structured(role=role, tools=tools, **kw)
+
+    p = ApproverThatLooksThingsUp(approver=[approve()],
+                                  critic=[CriticVerdict(objection=False, reasoning="ok")])
+    run(inv, conn, p)
+    critic_prompt = next(user for role, user in p.calls if role == "critic")
+    assert "lookups_the_approver_ran" in critic_prompt
+    assert '"tool": "get_vendor_history"' in critic_prompt and "window_days" in critic_prompt

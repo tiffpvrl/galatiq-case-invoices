@@ -56,6 +56,17 @@ class MockProvider:
             if f["code"] == "PRICE_BELOW_LIST":
                 return verdict(Decision.ESCALATE, "Unexplained price well below catalog; "
                                "could indicate a wrong item.")
+            if f["code"] == "NEAR_THRESHOLD":
+                history = by_name["get_vendor_history"].fn(vendor=inv["vendor"])
+                others = [h for h in history["invoices"]
+                          if h["invoice_number"] != inv["invoice_number"]]
+                combined = sum(h["total"] or 0 for h in others) + total
+                if others and combined >= 10_000:
+                    return verdict(Decision.ESCALATE,
+                                   f"{len(others)} other recent invoice(s) from this vendor bring "
+                                   f"the combined total to ${combined:,.2f}: possible split billing.")
+            if f["code"] == "FUTURE_DATED":
+                return verdict(Decision.ESCALATE, "The invoice is dated in the future.")
             if f["code"] == "AMBIGUOUS_DATE":
                 return verdict(Decision.ESCALATE, "A date can be read two ways.")
 
