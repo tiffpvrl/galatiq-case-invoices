@@ -127,7 +127,7 @@ Invoice text is untrusted. The approver sees structured fields and findings, not
 
 ## LLM provider
 
-xAI Grok (the case's specified engine) and Anthropic Claude behind a thin provider interface (`invoice_ap/llm.py`). Grok uses xAI's Responses API, which its current docs describe, and falls back to chat completions on a 404 (`GROK_API` forces one). Agents never import an SDK, so another OpenAI-compatible provider needs only a different base URL and key. A mock provider returns canned structured responses so tests and demos run offline and deterministically. The most capable model goes to the approver and critic and a cheaper non-reasoning one to extraction and notifications; model IDs are overridable per role with `AP_MODEL_<ROLE>`.
+xAI Grok (the case's specified engine) and any OpenAI-compatible endpoint (`LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`) behind a thin provider interface (`invoice_ap/llm.py`). If an endpoint rejects tool calling, the provider falls back to plain JSON replies validated against the same schema, with a repair loop; the approver then decides without lookups. Grok uses xAI's Responses API, which its current docs describe, and falls back to chat completions on a 404 (`GROK_API` forces one). Agents never import an SDK, so another OpenAI-compatible provider needs only a different base URL and key. A mock provider returns canned structured responses so tests and demos run offline and deterministically. The most capable model goes to the approver and critic and a cheaper non-reasoning one to extraction and notifications; model IDs are overridable per role with `AP_MODEL_<ROLE>`.
 
 ## Observability
 

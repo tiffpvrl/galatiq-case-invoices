@@ -27,7 +27,8 @@ class FakeXAI:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 outer.requests.append({"path": self.path, "body": body,
-                                       "auth": self.headers.get("Authorization")})
+                                       "auth": self.headers.get("Authorization"),
+                                       "headers": {k.lower(): v for k, v in self.headers.items()}})
                 queue = outer.replies.get(self.path)
                 status, payload = queue.pop(0) if queue else (404, {"error": "no such endpoint"})
                 data = json.dumps(payload).encode()

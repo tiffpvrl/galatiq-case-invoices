@@ -1,7 +1,7 @@
 """Score a model on the approval cases that need judgment.
 
 Usage:
-  python scripts/eval_judgment.py --provider anthropic --runs 3
+  python scripts/eval_judgment.py --provider grok --runs 3
   python scripts/eval_judgment.py --provider grok --runs 5 --out docs/eval-grok.md
   python scripts/eval_judgment.py --provider mock            # free, deterministic
 

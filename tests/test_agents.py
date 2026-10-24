@@ -304,119 +304,26 @@ def test_every_agent_schema_is_a_valid_tool_parameter_schema():
         json.dumps(spec)
 
 
-# --- Anthropic provider (fake client, no network) ------------------------------------
-
-
-class FakeMessages:
-    def __init__(self, scripted):
-        self.scripted, self.requests = list(scripted), []
-
-    def create(self, **kwargs):
-        self.requests.append({**kwargs, "messages": list(kwargs["messages"])})  # snapshot
-        item = self.scripted.pop(0)
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-
-def anthropic_client(scripted):
-    messages = FakeMessages(scripted)
-    return SimpleNamespace(messages=messages), messages
-
-
-def a_reply(*blocks, tokens=(10, 5)):
-    return SimpleNamespace(content=list(blocks),
-                           usage=SimpleNamespace(input_tokens=tokens[0], output_tokens=tokens[1]))
-
-
-def a_tool(id_, name, **input):
-    return SimpleNamespace(type="tool_use", id=id_, name=name, input=input)
-
-
-def test_anthropic_provider_runs_tools_then_returns_the_submission():
-    from invoice_ap.llm import AnthropicProvider, Tool
-
-    calls = []
-    tool = Tool("lookup", "d", {"type": "object", "properties": {}},
-                lambda **kw: calls.append(kw) or {"ok": True})
-    client, messages = anthropic_client([
-        a_reply(a_tool("1", "lookup", item="WidgetA")),
-        a_reply(a_tool("2", "submit", decision="APPROVE", rationale="ok")),
-    ])
-    provider = AnthropicProvider(client=client)
-    out = provider.structured(role="approver", system="s", user="u",
-                              schema=ApproverVerdict, tools=[tool])
-    assert out.decision == Decision.APPROVE and calls == [{"item": "WidgetA"}]
-    assert provider.usage[0].tool_calls == 1 and provider.usage[0].input_tokens == 20
-    first = messages.requests[0]
-    assert first["temperature"] == 0 and first["model"] == "claude-sonnet-5-5"
-    assert [t["name"] for t in first["tools"]] == ["lookup", "submit"]
-    result = messages.requests[1]["messages"][-1]["content"][0]
-    assert result["tool_use_id"] == "1" and result["content"] == '{"ok": true}'
-
-
-def test_anthropic_provider_asks_the_model_to_fix_an_invalid_submission():
-    from invoice_ap.llm import AnthropicProvider
-
-    client, messages = anthropic_client([
-        a_reply(a_tool("1", "submit", decision="MAYBE", rationale="x")),
-        a_reply(a_tool("2", "submit", decision="ESCALATE", rationale="x")),
-    ])
-    out = AnthropicProvider(client=client).structured(
-        role="approver", system="s", user="u", schema=ApproverVerdict)
-    assert out.decision == Decision.ESCALATE
-    retry = messages.requests[1]["messages"][2]["content"][0]
-    assert retry["is_error"] and "Invalid submission" in retry["content"]
-
-
-def test_anthropic_provider_retries_without_temperature_if_rejected():
-    from invoice_ap.llm import AnthropicProvider
-
-    client, messages = anthropic_client([
-        ValueError("temperature is not supported for this model"),
-        a_reply(a_tool("1", "submit", decision="ESCALATE", rationale="x")),
-    ])
-    out = AnthropicProvider(client=client).structured(
-        role="approver", system="s", user="u", schema=ApproverVerdict)
-    assert out.decision == Decision.ESCALATE
-    assert "temperature" in messages.requests[0] and "temperature" not in messages.requests[1]
-
-
-def test_anthropic_provider_wraps_failures_and_stops_when_nothing_is_submitted():
-    from invoice_ap.llm import AnthropicProvider
-
-    client, _ = anthropic_client([TimeoutError("slow")])
-    with pytest.raises(LLMError):
-        AnthropicProvider(client=client).structured(
-            role="approver", system="s", user="u", schema=ApproverVerdict)
-    client, _ = anthropic_client([a_reply(SimpleNamespace(type="text", text="hi"))] * 8)
-    with pytest.raises(LLMError, match="no valid submission"):
-        AnthropicProvider(client=client).structured(
-            role="approver", system="s", user="u", schema=ApproverVerdict)
-
-
 # --- provider selection ----------------------------------------------------------
 
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    for var in ("XAI_API_KEY", "ANTHROPIC_API_KEY", "AP_PROVIDER", "AP_MODEL_APPROVER"):
+    for var in ("XAI_API_KEY", "AP_PROVIDER", "AP_MODEL_APPROVER", "LLM_BASE_URL", "LLM_API_KEY",
+                "LLM_MODEL", "LLM_API", "LLM_EXTRA_HEADERS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("dotenv.load_dotenv", lambda *a, **k: False)  # ignore a local .env
     return monkeypatch
 
 
-def test_provider_selection_follows_the_configured_keys(clean_env):
+def test_provider_selection_follows_the_configured_key(clean_env):
     from invoice_ap.llm import make_provider
 
     assert make_provider().is_mock
-    clean_env.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
-    assert make_provider().name == "anthropic"
     clean_env.setenv("XAI_API_KEY", "xai-test")
-    assert make_provider().name == "grok"  # the case specifies Grok, so it wins by default
-    assert make_provider(name="anthropic").name == "anthropic"
-    clean_env.setenv("AP_PROVIDER", "anthropic")
-    assert make_provider().name == "anthropic"
+    assert make_provider().name == "grok"
+    clean_env.setenv("AP_PROVIDER", "mock")
+    assert make_provider().is_mock
     clean_env.delenv("AP_PROVIDER")
     assert make_provider(offline=True).is_mock
     assert make_provider(name="mock").is_mock
@@ -473,9 +380,8 @@ def test_the_critic_is_shown_the_approvers_actual_lookup_results(inv, conn):
 def test_a_missing_api_key_gives_an_actionable_error(clean_env):
     from invoice_ap.llm import make_provider
 
-    for name, var in (("grok", "XAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")):
-        with pytest.raises(LLMError, match=f"{var} is not set"):
-            make_provider(name=name)
+    with pytest.raises(LLMError, match="XAI_API_KEY is not set"):
+        make_provider(name="grok")
 
 
 def test_cli_reports_a_missing_key_cleanly(clean_env, tmp_path, capsys):

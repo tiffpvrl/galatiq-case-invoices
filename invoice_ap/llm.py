@@ -1,24 +1,36 @@
 """LLM provider interface.
 
-Agents talk to a Provider, never to an SDK. GrokProvider (xAI, the case's
-specified engine) runs a tool-calling loop over the OpenAI-compatible chat
-completions API; AnthropicProvider does the same over the Messages API; the
-offline MockProvider (mock_llm.py) answers deterministically so tests and demos
-run with no API key. Another OpenAI-compatible provider would only need a
-different base URL, key and model names.
+Agents talk to a Provider, never to an SDK. Two real providers share one loop
+over OpenAI-compatible APIs:
+
+  GrokProvider    xAI, the case's specified engine (XAI_API_KEY)
+  CustomProvider  any OpenAI-compatible endpoint: OpenAI, Anthropic's
+                  compatibility layer, Gemini's, Groq, Together, OpenRouter,
+                  Ollama or vLLM (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)
+
+The offline MockProvider (mock_llm.py) answers deterministically so tests and
+demos run with no key. A provider with a different wire format only has to
+implement `structured`.
 
 Every call goes through `structured`: the model must return an object that
 validates against a Pydantic schema, by calling a final `submit` tool. Tools
-the agent may use first (read-only lookups) are passed in `tools`.
+the agent may use first (read-only lookups) are passed in `tools`. If an
+endpoint rejects tool calling, the provider falls back to plain JSON replies
+validated against the same schema, with a repair loop; the agent then decides
+from the evidence it was given, without lookups.
 """
 
 import json
+import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol, Sequence
 
 from pydantic import BaseModel, ValidationError
+
+log = logging.getLogger("invoice_ap.llm")
 
 XAI_BASE_URL = "https://api.x.ai/v1"
 
@@ -30,12 +42,6 @@ GROK_MODELS = {
     "critic": "grok-4.7",
     "extractor": "grok-4.20-0309-non-reasoning",
     "notifier": "grok-4.20-0309-non-reasoning",
-}
-ANTHROPIC_MODELS = {
-    "approver": "claude-sonnet-5-5",
-    "critic": "claude-sonnet-5-5",
-    "extractor": "claude-haiku-5-5",
-    "notifier": "claude-haiku-5-5",
 }
 DEFAULT_MODELS = GROK_MODELS  # kept for callers that import the old name
 
@@ -131,6 +137,26 @@ def clean_schema(node):
     return out
 
 
+def _extract_json(text: str) -> str:
+    """The JSON object in a reply, tolerating markdown fences and surrounding prose."""
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end < start:
+        raise ValueError("no JSON object in the reply")
+    return text[start:end + 1]
+
+
+_TOOL_WORDS = re.compile(r"\b(tool|tools|function|functions)\b")
+_REJECT_WORDS = ("not support", "unsupported", "invalid", "not allowed", "not enabled", "does not")
+
+
+def _looks_like_tool_rejection(exc: Exception) -> bool:
+    """A 4xx saying the model or endpoint cannot do tool/function calling."""
+    if getattr(exc, "status_code", None) not in (400, 404, 422):
+        return False
+    message = str(exc).lower()
+    return bool(_TOOL_WORDS.search(message)) and any(w in message for w in _REJECT_WORDS)
+
+
 SUBMIT_DESCRIPTION = "Submit your final answer. Call this exactly once when done."
 
 
@@ -154,6 +180,8 @@ class OpenAICompatibleProvider:
     def __init__(self, client):
         self.client = client
         self.usage: list[Usage] = []
+        self.tools_supported = True  # flips to False if the endpoint rejects tool calling
+        self.json_mode = True  # flips to False if it rejects response_format
 
     def model_for(self, role: str) -> str:
         model = os.environ.get(f"AP_MODEL_{role.upper()}") or self.default_models.get(role)
@@ -208,8 +236,57 @@ class OpenAICompatibleProvider:
             self.usage.append(record)
 
     def _dispatch(self, model, record, system, user, schema, tools):
+        if not self.tools_supported:
+            return self._run_json(model, record, system, user, schema)
         run = self._run_responses if self.api == "responses" else self._run_chat
-        return run(model, record, system, user, schema, tools)
+        try:
+            return run(model, record, system, user, schema, tools)
+        except Exception as exc:
+            if _looks_like_tool_rejection(exc):
+                log.info("endpoint rejected tool calling (%s); using plain JSON replies",
+                         brief_error(exc))
+                self.tools_supported = False
+                return self._run_json(model, record, system, user, schema)
+            raise
+
+    # -- plain JSON replies (no tool calling) -------------------------------------------
+
+    def _run_json(self, model, record, system, user, schema, attempts: int = 3):
+        """For endpoints without tool calling: the schema goes in the prompt, the reply
+        is validated, and a bad reply is sent back with the error for correction."""
+        instructions = (
+            system
+            + "\n\nLookup tools are not available in this mode: decide from the evidence given "
+            "and say what you could not verify."
+            + "\n\nReply with a single JSON object and nothing else, matching this JSON Schema:\n"
+            + json.dumps(clean_schema(schema.model_json_schema())))
+        messages: list[dict] = [{"role": "system", "content": instructions},
+                                {"role": "user", "content": user}]
+        last_error = ""
+        for _ in range(attempts):
+            kwargs = {"model": model, "messages": messages}
+            if self.json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                response = self._call(self.client.chat.completions.create, **kwargs)
+            except Exception as exc:
+                if self.json_mode and "response_format" in str(exc).lower():
+                    self.json_mode = False  # this endpoint has no JSON mode: rely on the prompt
+                    continue
+                raise
+            if response.usage:
+                record.input_tokens += response.usage.prompt_tokens or 0
+                record.output_tokens += response.usage.completion_tokens or 0
+            text = response.choices[0].message.content or ""
+            try:
+                return schema.model_validate_json(_extract_json(text))
+            except (ValidationError, ValueError) as exc:
+                last_error = str(exc)
+                messages += [
+                    {"role": "assistant", "content": text},
+                    {"role": "user", "content": f"That reply was not valid: {exc}\n"
+                                                "Reply with the corrected JSON object only."}]
+        raise LLMError(f"no valid JSON reply after {attempts} attempts ({brief_error(ValueError(last_error))})")
 
     # -- chat completions ------------------------------------------------------------
 
@@ -333,126 +410,79 @@ class GrokProvider(OpenAICompatibleProvider):
         self.fallback_to_chat = choice == "responses"
 
 
-class AnthropicProvider:
-    """Claude via the Messages API: same contract and tool loop as Grok."""
+class CustomProvider(OpenAICompatibleProvider):
+    """Any OpenAI-compatible endpoint, configured entirely by settings:
 
-    name = "anthropic"
-    is_mock = False
-    MAX_TURNS = 8
-    default_models = ANTHROPIC_MODELS
+      LLM_BASE_URL       e.g. https://api.openai.com/v1/ or http://localhost:11434/v1
+      LLM_API_KEY        optional for local servers (defaults to "not-needed")
+      LLM_MODEL          model used for every role (override one with AP_MODEL_<ROLE>)
+      LLM_API            "chat" (default) or "responses"
+      LLM_EXTRA_HEADERS  optional JSON object of extra request headers
+    """
 
-    def __init__(self, api_key: str | None = None, client=None):
+    model_hint = "set LLM_MODEL in .env (or AP_MODEL_<ROLE>)"
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, client=None):
+        base_url = base_url or os.environ.get("LLM_BASE_URL")
+        if not base_url:
+            raise LLMError("LLM_BASE_URL is not set, so the custom provider cannot start. Add it "
+                           "to .env (see .env.example), or run with --offline.")
         if client is None:
-            import anthropic
+            from openai import OpenAI
 
-            client = anthropic.Anthropic(
-                api_key=_require_key(api_key, "ANTHROPIC_API_KEY", "Anthropic"),
+            try:
+                headers = json.loads(os.environ.get("LLM_EXTRA_HEADERS") or "{}")
+                if not isinstance(headers, dict):
+                    raise ValueError("not an object")
+            except ValueError as exc:
+                raise LLMError(f"LLM_EXTRA_HEADERS must be a JSON object ({exc})") from exc
+            client = OpenAI(
+                api_key=api_key or os.environ.get("LLM_API_KEY") or "not-needed",
+                base_url=base_url,
+                default_headers=headers or None,
                 max_retries=3,  # the SDK retries transient errors with backoff
                 timeout=60.0,
             )
-        self.client = client
-        self.usage: list[Usage] = []
+        super().__init__(client)
+        from urllib.parse import urlparse
 
-    def model_for(self, role: str) -> str:
-        model = os.environ.get(f"AP_MODEL_{role.upper()}") or self.default_models.get(role)
-        if not model:
-            raise LLMError(f"no model configured for role '{role}': set AP_MODEL_<ROLE>")
-        return model
+        self.name = f"custom ({urlparse(base_url).netloc or base_url})"
+        choice = os.environ.get("LLM_API", "chat").lower()
+        if choice not in ("responses", "chat"):
+            raise LLMError("LLM_API must be 'responses' or 'chat'")
+        self.api = choice
+        self.fallback_to_chat = choice == "responses"
 
-    def _create(self, **kwargs):
-        """Temperature 0 for repeatability; retry once without it if the model
-        rejects the parameter rather than fail the invoice."""
-        temperature = os.environ.get("AP_TEMPERATURE", "0")
-        if temperature:
-            kwargs["temperature"] = float(temperature)
-        try:
-            return self.client.messages.create(**kwargs)
-        except Exception as exc:
-            if "temperature" in kwargs and "temperature" in str(exc).lower():
-                kwargs.pop("temperature")
-                return self.client.messages.create(**kwargs)
-            raise
-
-    def structured(self, *, role, system, user, schema, tools=(), context=None):
-        model = self.model_for(role)
-        record = Usage(role=role, model=model)
-        started = time.perf_counter()
-        specs = [{"name": t.name, "description": t.description, "input_schema": t.input_schema}
-                 for t in tools]
-        specs.append({"name": "submit",
-                      "description": "Submit your final answer. Call this exactly once when done.",
-                      "input_schema": schema.model_json_schema()})
-        by_name = {t.name: t for t in tools}
-        messages: list[dict] = [{"role": "user", "content": user}]
-        try:
-            for _ in range(self.MAX_TURNS):
-                response = self._create(model=model, max_tokens=2048, system=system,
-                                        messages=messages, tools=specs)
-                record.input_tokens += response.usage.input_tokens
-                record.output_tokens += response.usage.output_tokens
-                messages.append({"role": "assistant", "content": response.content})
-                results, submitted = [], None
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    if block.name == "submit":
-                        try:
-                            submitted = schema.model_validate(block.input)
-                            results.append({"type": "tool_result", "tool_use_id": block.id,
-                                            "content": "ok"})
-                        except ValidationError as exc:
-                            results.append({"type": "tool_result", "tool_use_id": block.id,
-                                            "is_error": True,
-                                            "content": f"Invalid submission, fix and resubmit: {exc}"})
-                        continue
-                    record.tool_calls += 1
-                    tool = by_name.get(block.name)
-                    try:
-                        if tool is None:
-                            raise KeyError(f"unknown tool {block.name}")
-                        content, is_error = json.dumps(tool.fn(**block.input), default=str), False
-                    except Exception as exc:  # tool errors go back to the model
-                        content, is_error = f"Tool error: {exc}", True
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": content, "is_error": is_error})
-                if submitted is not None:
-                    return submitted
-                if not results:  # model stopped without submitting
-                    results = [{"type": "text", "text": "Call the submit tool with your answer."}]
-                messages.append({"role": "user", "content": results})
-            raise LLMError(f"{role}: no valid submission after {self.MAX_TURNS} turns")
-        except LLMError:
-            raise
-        except Exception as exc:
-            raise LLMError(f"{role}: {brief_error(exc)}") from exc
-        finally:
-            record.latency_ms = (time.perf_counter() - started) * 1000
-            self.usage.append(record)
+    @property
+    def default_models(self) -> dict[str, str]:  # type: ignore[override]
+        model = os.environ.get("LLM_MODEL", "")
+        return {role: model for role in GROK_MODELS} if model else {}
 
 
-PROVIDERS = ("grok", "anthropic", "mock")
+PROVIDERS = ("grok", "custom", "mock")
 
 
 def make_provider(offline: bool = False, name: str | None = None) -> "Provider":
-    """Pick a provider: an explicit name (or AP_PROVIDER), else Grok if
-    XAI_API_KEY is set (the case specifies Grok), else Anthropic if
-    ANTHROPIC_API_KEY is set, else the offline mock. offline=True forces the
-    mock. With both keys present, set AP_PROVIDER to choose."""
+    """Pick a provider: an explicit name (or AP_PROVIDER), else a custom
+    OpenAI-compatible endpoint if LLM_BASE_URL is set, else Grok if XAI_API_KEY
+    is set, else the offline mock. offline=True forces the mock regardless."""
     from dotenv import load_dotenv
 
     load_dotenv()
+    if offline:
+        from .mock_llm import MockProvider
+
+        return MockProvider()
     name = (name or os.environ.get("AP_PROVIDER") or "").lower() or None
     if name is not None and name not in PROVIDERS:
         raise ValueError(f"unknown provider '{name}'; choose from {', '.join(PROVIDERS)}")
-    if offline or name == "mock":
-        name = "mock"
-    elif name is None:
-        name = ("grok" if os.environ.get("XAI_API_KEY")
-                else "anthropic" if os.environ.get("ANTHROPIC_API_KEY") else "mock")
+    if name is None:
+        name = ("custom" if os.environ.get("LLM_BASE_URL")
+                else "grok" if os.environ.get("XAI_API_KEY") else "mock")
+    if name == "custom":
+        return CustomProvider()
     if name == "grok":
         return GrokProvider()
-    if name == "anthropic":
-        return AnthropicProvider()
     from .mock_llm import MockProvider
 
     return MockProvider()

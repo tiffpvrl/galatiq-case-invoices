@@ -23,7 +23,7 @@ class Pong(BaseModel):
 def main() -> int:
     provider = make_provider()
     if provider.is_mock:
-        print("No API key found (set XAI_API_KEY or ANTHROPIC_API_KEY in .env). "
+        print("No API key found (set XAI_API_KEY, or LLM_BASE_URL and LLM_MODEL, in .env). "
               "The offline mock would be used.")
         return 2
     print(f"provider: {provider.name}")

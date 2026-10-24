@@ -115,4 +115,4 @@ Caveat: most cost and exception figures come from vendor blogs with commercial i
 
 ## 5. Evidence from running the system
 
-See [eval-anthropic.md](eval-anthropic.md) for the model evaluation: the labeled judgment cases rerun five times each on a live model. Two design gaps (the approver having no way to check a vendor's other invoices, and the critic not seeing the approver's lookups) were found by reading the critic's objections in an earlier run and fixed before the final numbers.
+See [eval-results.md](eval-results.md) for the model evaluation: the labeled judgment cases rerun five times each on a live model. Two design gaps (the approver having no way to check a vendor's other invoices, and the critic not seeing the approver's lookups) were found by reading the critic's objections in an earlier run and fixed before the final numbers.

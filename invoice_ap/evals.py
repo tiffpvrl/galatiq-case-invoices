@@ -181,7 +181,7 @@ def summarize(reports: list[CaseReport]) -> dict:
 def render_markdown(reports: list[CaseReport], summary: dict, provider: str) -> str:
     runs = summary["runs"] // summary["cases"]
     lines = [
-        f"# Approval evaluation: {provider}",
+        "# Approval evaluation",
         "",
         f"{summary['cases']} judgment cases x {runs} runs each. Labels are the case author's "
         "judgment, not ground truth; ambiguous cases accept more than one decision.",
