@@ -30,8 +30,8 @@ Hard fails reject immediately with an explanation. Flags pass forward as evidenc
 | Negative quantity or negative total | Hard fail | Data integrity; credit memos are a different document type |
 | Missing vendor or invoice number | Hard fail | Cannot be paid or audited without them |
 | Exact duplicate of an already-processed invoice | Hard fail | Duplicate payment is a classic AP loss |
-| Revised invoice, original **unpaid** | Supersede | Mark the original superseded and process the revision fresh (INV-1004 / revised) |
-| Revised invoice, original **already paid** | Human review | Never auto-pay; show the delta |
+| Revised invoice (same number and vendor, different content) | Human review | Revisions are rare and risky, so automating them saves little and risks a lot. Show the delta and the original's status (INV-1004 / revised) |
+| Vendor matches only a former name or alias (INV-1012: "formerly FastShip Ltd.") | Flag | Needs confirmation and a vendor-master update; also an impersonation vector |
 | Same invoice number, different vendor | Flag | ID collision or fraud |
 | Unit price deviates from catalog beyond tolerance | Flag | Price drift is often legitimate (discounts, e.g. INV-1013 volume discount) |
 | Unknown or unapproved vendor | Flag | New vendors are legitimate sometimes, but are the entry point for vendor-impersonation fraud |
@@ -57,7 +57,9 @@ Guards found in the sample data:
 
 ### Price tolerance
 
-Industry practice is a percentage tolerance, often combined with a dollar cap where the tighter limit governs. A percentage alone is risky on high-value lines. Examples in the sources use about 2%. **Our setting: 2% of catalog price, capped at a small absolute amount per line (configurable).** The 2% is an illustrative convention from vendor documentation, not a standard.
+Industry practice is a percentage tolerance, often combined with a dollar cap where the tighter limit governs. A percentage alone is risky on high-value lines. Examples in the sources use about 2%. **Our setting is asymmetric, because overpaying is the loss.** Above catalog price: flag over 2%, with a dollar cap per line (configurable). Below catalog price: flag only over 10%; smaller discounts are INFO (INV-1013's 4% volume discounts should not flag). The 2% is an illustrative convention from vendor documentation, not a standard.
+
+Invoices over $50K escalate to a CFO tier rather than being rejected: rejecting a legitimate large invoice only delays it.
 
 ## 3. What the VP approver is actually checking
 
