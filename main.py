@@ -19,6 +19,7 @@ from rich.markup import escape
 from rich.prompt import Confirm, Prompt
 
 from invoice_ap import review
+from invoice_ap import insights
 from invoice_ap.config import DB_PATH, INVOICE_DIR, RUN_DIR, SETTINGS
 from invoice_ap.db import init_db
 from invoice_ap.llm import PROVIDERS, make_provider
@@ -37,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     src.add_argument("--all", action="store_true", help=f"process every file in {INVOICE_DIR}")
     src.add_argument("--review", action="store_true",
                      help="interactively resolve invoices awaiting human review")
+    src.add_argument("--insights", action="store_true",
+                     help="suggest policy changes from recorded human review decisions")
     p.add_argument("--fresh", action="store_true",
                    help="reset the database (inventory seed, empty ledger) before running")
     p.add_argument("--provider", choices=PROVIDERS,
@@ -102,9 +105,9 @@ def run_review(conn, console: Console) -> int:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if not (args.invoice_path or args.all or args.review):
+    if not (args.invoice_path or args.all or args.review or args.insights):
         build_parser().print_usage()
-        print("error: give --invoice_path PATH, --all, or --review", file=sys.stderr)
+        print("error: give --invoice_path PATH, --all, --review, or --insights", file=sys.stderr)
         return 2
 
     console = Console(quiet=args.json, highlight=False)
@@ -117,6 +120,14 @@ def main(argv=None) -> int:
         print(f"error: could not start the LLM provider: {exc}", file=sys.stderr)
         return 2
     conn = init_db(args.db, reset=args.fresh)
+
+    if args.insights:
+        report = insights.compute_insights(conn)
+        if args.json:
+            print(report.to_json())
+        else:
+            insights.render(console, report)
+        return 0
 
     if args.review:
         try:
