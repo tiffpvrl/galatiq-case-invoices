@@ -6,10 +6,36 @@ The original case brief is in [docs/CASE.md](docs/CASE.md).
 
 **The short version**
 
-- **Most of the system is plain code, on purpose.** Arithmetic, stock lookups and duplicate checks are exact, so they run as code. An LLM is called only where there is ambiguity to reason about: reading messy text, weighing flagged invoices, and a second-opinion review.
-- **A clean invoice costs zero model calls, start to finish.** It is approved, paid and notified by code. Across the 20 sample files the live run averaged 1.3 model calls per invoice, because the model also reads messy text and writes the notes for held and rejected invoices.
+- **Most of the system is plain code, on purpose.** Exact checks (arithmetic, stock, duplicates) run as code. An LLM is used only where there is ambiguity: reading messy text, weighing flagged invoices, and a second-opinion review. A clean invoice costs zero model calls.
 - **The model can only make a decision more cautious.** A deterministic policy floor runs first and the model can never override it.
-- **It was evaluated, not just demoed.** 70 live runs of the judgment cases produced 0 unsafe approvals (details below), and 247 tests pass.
+- **Evaluated, not just demoed.** 70 live runs of the judgment cases produced 0 unsafe approvals, and 247 tests pass.
+
+## Business impact
+
+**What the design choices mean for the business**
+
+| Design choice | Business effect |
+|---|---|
+| Plain code for every exact check; AI only where there is ambiguity | Predictable cost and auditable decisions: the AI is used only where it adds something. |
+| A policy floor the AI cannot override | The AI can never approve past a fraud flag or an approval limit, which is what auditors need to see. |
+| Reject only what cannot be legitimate; everything else is a flag | Fewer wrongful rejections (each one is a vendor dispute) without letting bad invoices through. |
+| The AI's reading is checked against the source, with retries | Attacks the 30% error rate directly: values that are not in the document are caught before validation. |
+| Duplicate, revision and re-bill checks; idempotent payment | Prevents duplicate payments, a classic AP loss. A revised invoice pays only the difference. |
+| Held invoices routed to the right owner, with the evidence attached | Attacks the five-day delay: exceptions reach Treasury, the buyer or the controller directly instead of waiting in a shared inbox. |
+| Every decision and every human override recorded | An audit trail, and data for tuning the rules from real reviewer behavior. |
+
+**What we measured** on the provided sample. It is deliberately about half bad, so these figures show the controls working, not what Acme would save:
+
+- 80% of invoices resolved without a person; the rest went to review with the reasons and evidence attached.
+- About 4 seconds per invoice end to end, against a baseline of days.
+- About $181K of bad invoices stopped, and 0 unsafe approvals in 70 evaluation runs.
+- 1.3 model calls per invoice, about 36K input and 18K output tokens for all 20. Set `AP_PRICE_IN_PER_MTOK` and `AP_PRICE_OUT_PER_MTOK` in `.env` and each run reports dollars per invoice.
+
+**Sizing the savings for Acme.** Savings per year is approximately
+
+> invoices per year × [ manual cost per invoice − ( touchless share × automated cost + exception share × cost to review ) ] + errors avoided × cost of an error
+
+Every input has to come from Acme: its invoice volume; its team's time per invoice (industry averages are roughly $9 to $10, and about $3 for best-in-class teams); the touchless share measured on its real mix (industry average roughly a third, best-in-class about half); the system's token cost; clerk time per exception; and the cost of an error (rework, overpayment, duplicate payment). The industry figures are vendor-published and directional. Nothing here was run on real volume.
 
 ## Quick start
 
@@ -34,7 +60,7 @@ With no API key, everything runs on an **offline mock provider** (rule-based ext
 | Grok (the case's specified engine) | `XAI_API_KEY=...` |
 | Any OpenAI-compatible endpoint | `LLM_BASE_URL=...`, `LLM_API_KEY=...`, `LLM_MODEL=...` |
 
-I tested the system using Claude, since that was the API available to me. It's built for Grok's API as the case specifies (set `XAI_API_KEY`), and runs on any OpenAI-compatible endpoint (see `.env.example`).
+I tested the system using Claude, since that was the API available to me. It is built for Grok's API as the case specifies, and runs on any OpenAI-compatible endpoint (see `.env.example`).
 
 Other useful flags: `--json` (machine-readable), `--brief` (one line per invoice), `--offline` (force the mock), `--provider grok|custom|mock`, `--reserve-stock`, `--as-of YYYY-MM-DD`, `-v` (structured trace to stderr), `--open` (open the HTML report), `--no-report`. Each run writes `runs/<run-id>/report.html`, a JSON-lines trace, and the notification drafts (nothing is ever sent).
 
@@ -124,13 +150,13 @@ In practice this runs in the background and the AP team works from queues, not f
 | **Buyers and vendor management** | Settle price disputes and vendor-master questions routed to them |
 | **Auditors** | Read the trace and ledger: who decided what, and why |
 
-**The intended flow.** Invoices arrive in a shared AP inbox, a supplier portal or an EDI feed. A watcher runs each one through the pipeline as it lands. Every invoice ends in one of three queues:
+**The intended flow.** Invoices arrive in a shared AP inbox, a supplier portal or an EDI feed, and a watcher runs each one through the pipeline as it lands. Every invoice ends in one of three queues:
 
-- **Ready to pay** feeds the next payment run. (Real AP releases payments in scheduled batches, often by a separate person. The prototype pays immediately with a mock call.)
-- **Needs review** is a work queue, and each item names the role best placed to resolve it: Treasury for FX, the buyer for a price dispute, the controller for a suspected re-bill, the CFO above $50K.
-- **Rejected** is blocked with its reasons. When every reason is one the vendor can fix, a correction request is drafted for an AP clerk to review. Possible fraud is never auto-contacted.
+- **Ready to pay** feeds the next payment run.
+- **Needs review** is a work queue; each item names the role best placed to resolve it (Treasury for FX, the buyer for a price dispute, the controller for a suspected re-bill, the CFO above $50K).
+- **Rejected** is blocked with its reasons. If every reason is one the vendor can fix, a correction request is drafted for an AP clerk to review; possible fraud is never auto-contacted.
 
-**Notifications.** A pop-up per invoice would bury people, so the design is a queue with counts as the main surface, an alert only for items needing action now, and a digest for the manager. The system writes the message content (to the suggested owner) as drafts. It never sends anything.
+A pop-up per invoice would bury people, so the surface is a queue with counts, an alert only for items needing action now, and a digest for the manager. The system only writes drafts; it never sends anything.
 
 **What exists here and what production adds.**
 
@@ -146,7 +172,7 @@ In practice this runs in the background and the AP team works from queues, not f
 
 The rules come from how accounts payable works, not from guesses. The full write-up, with sources and where the evidence is thin, is in [docs/process-notes.md](docs/process-notes.md). The decisions that matter most:
 
-- **Inventory stands in for the PO and goods receipt.** In a real P2P cycle, AP matches the invoice against the purchase order and the goods receipt (a "3-way match"). The brief provides only an inventory table, so we treat it as "goods ordered and received", and billing more than is on hand is billing beyond what arrived. This is our interpretation, and the README states it as one.
+- **Inventory stands in for the PO and goods receipt.** In a real P2P cycle, AP matches the invoice against the purchase order and the goods receipt (a "3-way match"). The brief provides only an inventory table, so we treat it as "goods ordered and received", and billing more than is on hand is billing beyond what arrived. This is our interpretation.
 - **Hard fail vs. flag.** Hard-fail only when an invoice cannot be legitimate under any reading (negative values, missing vendor, an item that doesn't exist, billing beyond received goods, an exact duplicate). Everything caused by *our* uncertainty becomes a flag or goes to a human. A false approve loses money; a false reject costs a vendor dispute.
 - **Thresholds are policy parameters, not facts.** There is no authoritative benchmark for approval limits; the sources are vendor guidance with examples between $500 and $5,000. The $10K scrutiny limit is the brief's own example. Everything lives in [invoice_ap/config.py](invoice_ap/config.py).
 - **Price tolerance is asymmetric** (flag over 2% above list, but only over 10% below), because overpaying is the loss.
@@ -189,51 +215,40 @@ A harness ([scripts/eval_judgment.py](scripts/eval_judgment.py)) reruns the 14 c
 
 The first evaluation scored 95% with an inconsistent case. Reading the critic's objections showed two real design gaps: the approver had no way to look up a vendor's other invoices, yet claimed split billing was unlikely, and the critic couldn't see the approver's lookups. Both were fixed (a `get_vendor_history` tool; the critic now sees the actual lookup results), and the final numbers above are from after those fixes.
 
-### Business impact
-
-- **Speed.** The live run took about 4 seconds per invoice, against a baseline of days.
-- **Control.** 80% of sample invoices were resolved without a person. The rest went to review with the reasons and evidence attached.
-- **Token cost.** The 20-sample live run used about 36K input and 18K output tokens (1.3 model calls per invoice). Set `AP_PRICE_IN_PER_MTOK` and `AP_PRICE_OUT_PER_MTOK` in `.env` and the run summary shows dollars per invoice. The industry average cost to process an invoice manually is roughly $9–10; sources are vendor blogs, so treat that as directional.
-- **Caution on extrapolation.** The sample set is deliberately adversarial (about half the invoices are bad), so these numbers show that the controls work, not what Acme would save. A savings estimate needs Acme's real invoice mix.
-
 ## Testing
 
 247 tests, about 14 seconds, no network:
 
-- **Golden outcomes** for all 20 sample files and 31 extra cases ([data/test_cases/](data/test_cases/), generated by [scripts/generate_test_cases.py](scripts/generate_test_cases.py), each with a documented purpose): boundaries at exactly $10,000 and exactly the stock on hand, duplicates across file formats, near-miss item names, malformed and garbage files, prompt injection, re-billing under a new invoice number, and more.
+- **Golden outcomes** for all 20 sample files and 31 extra cases ([data/test_cases/](data/test_cases/), generated by [scripts/generate_test_cases.py](scripts/generate_test_cases.py), each with a documented purpose): boundaries at exactly $10,000 and exactly the stock on hand, cross-format duplicates, near-miss item names, malformed files, prompt injection, re-billing under a new number, and more.
 - **Agent mechanics** with scripted providers: loop bounds, citation rules, extraction retry, tool-use loops.
 - **Wire-level tests** for Grok: a local HTTP server using xAI's documented response shapes, driven by the real `openai` SDK.
-- **Safety invariants**: never pay on error, never pay a hard fail, idempotent payment.
+- **Safety invariants:** never pay on error, never pay a hard fail, idempotent payment.
 
 ## The report and the review queue
 
-Every run writes a self-contained HTML report (`runs/<run-id>/report.html`, no network, works offline). It is laid out for the person working the queue:
+Every run writes a self-contained HTML report (`runs/<run-id>/report.html`; no network, works offline), laid out for the person working the queue:
 
-- **A five-second summary:** how many invoices need a person and the dollars held, the share resolved without one, a "possible fraud" banner when something was blocked for deception signals, and a quiet outcome bar you can switch between dollars and count.
-- **Needs review first,** sorted most senior owner first, with filter chips per suggested owner (CFO, VP, Controller, Treasury, Vendor management, Buyer, AP clerk). Long lists show the first dozen with "Show more".
-- **Rejections grouped by what can be done about them:** possible fraud (do not contact), fixable by vendor (a correction request is drafted), duplicates, and invalid. **Ready to pay** is collapsed, since clean invoices need no attention.
-- **A detail panel** beside the list (a full screen on a phone) with the plain-language reason, the decision path, every reason with its severity, line items, facts, and expandable sections for the approver and critic reasoning, the lookups it ran, operational warnings, and the draft messages. Previous and next step through a queue.
-- Search across every queue, light, dark and system themes, keyboard operation, a print layout, and "View as table" under the chart.
+- **A five-second summary:** invoices needing a person and the dollars held, the share resolved without one, a "possible fraud" banner when something was blocked for deception signals, and an outcome bar you can switch between dollars and count.
+- **Needs review first,** most senior owner first, with filter chips per suggested owner (CFO through AP clerk) and "Show more" beyond a dozen.
+- **Rejections grouped by what can be done about them:** possible fraud (do not contact), fixable by vendor (correction drafted), duplicates, and invalid. **Ready to pay** is collapsed, since clean invoices need no attention.
+- **A detail panel** (a full screen on a phone): the plain-language reason, decision path, severity-tagged reasons, line items, facts, and expandable approver and critic reasoning, the lookups it ran, operational warnings, and the drafts.
+- Search across every queue, light and dark themes, keyboard operation, a print layout, and "View as table" under the chart.
 
-Everything that came from an invoice is escaped, because invoice text is untrusted. The interactions are tested in a real headless browser when Chrome is installed.
+Invoice text is escaped because it is untrusted, and the interactions are tested in headless Chrome when it is installed. The report is a snapshot; review stays in the terminal on purpose, since a local page that can approve payments is a security surface that does not belong in a prototype.
 
-The report is a snapshot, and review stays in the terminal on purpose: a local web page that can approve payments is a security surface that does not belong in a prototype.
+`python main.py --review` is an interactive queue for escalated invoices: approve, reject or hold, with the reasons, evidence and suggested owner shown. Every decision is stored with a reviewer and note, and approving a revision pays only the difference.
 
-`python main.py --review` is an interactive queue for escalated invoices: approve, reject or hold, with the reasons, the evidence and the suggested owner shown. Every decision is stored with a reviewer and note. Approving a revision pays only the difference.
-
-`python main.py --insights` turns those decisions into *suggested* policy changes, such as "reviewers approved every single-flag FX invoice, so consider letting the approver weigh it". It uses only single-flag invoices (otherwise a decision can't be attributed to a flag) and requires a statistical bar, so "5 of 5" doesn't move policy but "12 of 12" does. Suggestions are never applied automatically. There are no real reviewer decisions yet; `scripts/simulate_reviews.py` creates a separate demo database, and the insights output labels simulated data clearly.
+`python main.py --insights` turns those decisions into *suggested* policy changes, such as "reviewers approved every single-flag FX invoice, so consider letting the approver weigh it". It counts only single-flag invoices (otherwise a decision can't be attributed to a flag) and requires a statistical bar, so "5 of 5" doesn't move policy but "12 of 12" does. Suggestions are never applied automatically. There are no real reviewer decisions yet; `scripts/simulate_reviews.py` builds a separate demo database, and the output labels simulated data clearly.
 
 ## Limitations and next steps
 
-- **No real PO or goods-receipt tables.** The inventory table is a stand-in (see above). A production version would do a true 3-way match.
-- **Paying doesn't decrement stock**, so two invoices can each pass against the same received goods. `--reserve-stock` exposes this using the ledger; a production system would keep a ledger of matched quantities.
-- **Split billing is partly covered.** The approver can check a vendor's recent invoices, but there is no deterministic cross-invoice rule, and the sample data never exercises it beyond one constructed case.
+- **Paying doesn't decrement stock,** so two invoices can each pass against the same received goods. `--reserve-stock` exposes this using the ledger; a production system would keep a ledger of matched quantities.
+- **Split billing is partly covered.** The approver can check a vendor's recent invoices, but there is no deterministic cross-invoice rule, and the sample data only exercises it through one constructed case.
 - **No FX.** Non-USD invoices are escalated, not converted.
-- **The rule-based text extractor was tuned on the ten sample text and PDF files.** On live runs the LLM matched it on every core field, but unseen layouts are the LLM's job, and that wasn't tested on a larger variety.
-- **Evaluation is small and the labels are mine.** 14 cases, one provider, and ambiguous cases accept several decisions. It shows the approach works and gives a repeatable method, not a proof.
-- **The critic never objected in the final evaluation.** It was valuable for finding the two gaps above; whether it earns its roughly 25% share of approval calls ongoing is open. A config lever exists to restrict it to high-stakes invoices.
+- **The rule-based text extractor was tuned on the ten sample text and PDF files.** On live runs the LLM matched it on every core field, but unseen layouts are the LLM's job and weren't tested on a wider variety.
+- **The evaluation is small and the labels are mine.** 14 cases, one provider, and ambiguous cases accept several decisions. It shows the approach works and gives a repeatable method, not a proof.
+- **The critic never objected in the final evaluation.** It was valuable for finding the two gaps above; whether it earns its roughly 25% share of approval calls is open, and a config lever can restrict it to high-stakes invoices.
 - **A model can reject outright.** The LLM sometimes rejects an overcharged invoice instead of escalating it. Both are safe, but a stricter policy would let only humans reject.
-- **Review is synchronous and in the terminal,** and the report is a static snapshot, not a live app. The next steps are asynchronous review with assignments, delivery of the drafts, and learning thresholds from real reviewer decisions.
 
 ## Repository layout
 
@@ -263,4 +278,4 @@ tests/                   247 tests
 docs/                    CASE.md (the brief), architecture, process-notes, eval-results
 ```
 
-More detail: [docs/architecture.md](docs/architecture.md) (design and failure paths), [docs/process-notes.md](docs/process-notes.md) (the AP domain research and its sources), [docs/eval-results.md](docs/eval-results.md) (the evaluation).
+Design and failure paths: [docs/architecture.md](docs/architecture.md).
