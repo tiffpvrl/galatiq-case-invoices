@@ -1,0 +1,20 @@
+{
+  "invoice_number": "INV-2002",
+  "vendor": {
+    "name": "Summit Manufacturing Co."
+  },
+  "date": "2026-01-20",
+  "due_date": "2026-02-20",
+  "line_items": [
+    {
+      "item": "ControlPanel",
+      "quantity": 4,
+      "unit_price": 2500.0
+    }
+  ],
+  "subtotal": 10000.0,
+  "tax_amount": 0.0,
+  "total": 10000.0,
+  "currency": "USD",
+  "payment_terms": "Net 30"
+}

@@ -1,9 +1,10 @@
 """LLM provider interface.
 
-Agents talk to a Provider, never to an SDK. GrokProvider (xAI) runs a
-tool-calling loop over the OpenAI-compatible chat completions API; the offline
-MockProvider (mock_llm.py) answers deterministically so tests and demos run
-with no API key. Another OpenAI-compatible provider would only need a
+Agents talk to a Provider, never to an SDK. GrokProvider (xAI, the case's
+specified engine) runs a tool-calling loop over the OpenAI-compatible chat
+completions API; AnthropicProvider does the same over the Messages API; the
+offline MockProvider (mock_llm.py) answers deterministically so tests and demos
+run with no API key. Another OpenAI-compatible provider would only need a
 different base URL, key and model names.
 
 Every call goes through `structured`: the model must return an object that
@@ -29,6 +30,12 @@ GROK_MODELS = {
     "critic": "grok-4.7",
     "extractor": "grok-4.20-0309-non-reasoning",
     "notifier": "grok-4.20-0309-non-reasoning",
+}
+ANTHROPIC_MODELS = {
+    "approver": "claude-sonnet-5-5",
+    "critic": "claude-sonnet-5-5",
+    "extractor": "claude-haiku-5-5",
+    "notifier": "claude-haiku-5-5",
 }
 DEFAULT_MODELS = GROK_MODELS  # kept for callers that import the old name
 
@@ -222,12 +229,111 @@ class GrokProvider(OpenAICompatibleProvider):
         super().__init__(client)
 
 
-PROVIDERS = ("grok", "mock")
+class AnthropicProvider:
+    """Claude via the Messages API: same contract and tool loop as Grok."""
+
+    name = "anthropic"
+    is_mock = False
+    MAX_TURNS = 8
+    default_models = ANTHROPIC_MODELS
+
+    def __init__(self, api_key: str | None = None, client=None):
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(
+                api_key=api_key or os.environ["ANTHROPIC_API_KEY"],
+                max_retries=3,  # the SDK retries transient errors with backoff
+                timeout=60.0,
+            )
+        self.client = client
+        self.usage: list[Usage] = []
+
+    def model_for(self, role: str) -> str:
+        model = os.environ.get(f"AP_MODEL_{role.upper()}") or self.default_models.get(role)
+        if not model:
+            raise LLMError(f"no model configured for role '{role}': set AP_MODEL_<ROLE>")
+        return model
+
+    def _create(self, **kwargs):
+        """Temperature 0 for repeatability; retry once without it if the model
+        rejects the parameter rather than fail the invoice."""
+        temperature = os.environ.get("AP_TEMPERATURE", "0")
+        if temperature:
+            kwargs["temperature"] = float(temperature)
+        try:
+            return self.client.messages.create(**kwargs)
+        except Exception as exc:
+            if "temperature" in kwargs and "temperature" in str(exc).lower():
+                kwargs.pop("temperature")
+                return self.client.messages.create(**kwargs)
+            raise
+
+    def structured(self, *, role, system, user, schema, tools=(), context=None):
+        model = self.model_for(role)
+        record = Usage(role=role, model=model)
+        started = time.perf_counter()
+        specs = [{"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                 for t in tools]
+        specs.append({"name": "submit",
+                      "description": "Submit your final answer. Call this exactly once when done.",
+                      "input_schema": schema.model_json_schema()})
+        by_name = {t.name: t for t in tools}
+        messages: list[dict] = [{"role": "user", "content": user}]
+        try:
+            for _ in range(self.MAX_TURNS):
+                response = self._create(model=model, max_tokens=2048, system=system,
+                                        messages=messages, tools=specs)
+                record.input_tokens += response.usage.input_tokens
+                record.output_tokens += response.usage.output_tokens
+                messages.append({"role": "assistant", "content": response.content})
+                results, submitted = [], None
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    if block.name == "submit":
+                        try:
+                            submitted = schema.model_validate(block.input)
+                            results.append({"type": "tool_result", "tool_use_id": block.id,
+                                            "content": "ok"})
+                        except ValidationError as exc:
+                            results.append({"type": "tool_result", "tool_use_id": block.id,
+                                            "is_error": True,
+                                            "content": f"Invalid submission, fix and resubmit: {exc}"})
+                        continue
+                    record.tool_calls += 1
+                    tool = by_name.get(block.name)
+                    try:
+                        if tool is None:
+                            raise KeyError(f"unknown tool {block.name}")
+                        content, is_error = json.dumps(tool.fn(**block.input), default=str), False
+                    except Exception as exc:  # tool errors go back to the model
+                        content, is_error = f"Tool error: {exc}", True
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": content, "is_error": is_error})
+                if submitted is not None:
+                    return submitted
+                if not results:  # model stopped without submitting
+                    results = [{"type": "text", "text": "Call the submit tool with your answer."}]
+                messages.append({"role": "user", "content": results})
+            raise LLMError(f"{role}: no valid submission after {self.MAX_TURNS} turns")
+        except LLMError:
+            raise
+        except Exception as exc:
+            raise LLMError(f"{role}: {brief_error(exc)}") from exc
+        finally:
+            record.latency_ms = (time.perf_counter() - started) * 1000
+            self.usage.append(record)
+
+
+PROVIDERS = ("grok", "anthropic", "mock")
 
 
 def make_provider(offline: bool = False, name: str | None = None) -> "Provider":
-    """Grok when XAI_API_KEY is configured (or AP_PROVIDER=grok), otherwise the
-    offline mock. offline=True forces the mock."""
+    """Pick a provider: an explicit name (or AP_PROVIDER), else Grok if
+    XAI_API_KEY is set (the case specifies Grok), else Anthropic if
+    ANTHROPIC_API_KEY is set, else the offline mock. offline=True forces the
+    mock. With both keys present, set AP_PROVIDER to choose."""
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -237,9 +343,12 @@ def make_provider(offline: bool = False, name: str | None = None) -> "Provider":
     if offline or name == "mock":
         name = "mock"
     elif name is None:
-        name = "grok" if os.environ.get("XAI_API_KEY") else "mock"
+        name = ("grok" if os.environ.get("XAI_API_KEY")
+                else "anthropic" if os.environ.get("ANTHROPIC_API_KEY") else "mock")
     if name == "grok":
         return GrokProvider()
+    if name == "anthropic":
+        return AnthropicProvider()
     from .mock_llm import MockProvider
 
     return MockProvider()

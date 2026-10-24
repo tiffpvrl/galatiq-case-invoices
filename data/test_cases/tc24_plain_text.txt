@@ -1,0 +1,15 @@
+INVOICE
+
+Vendor: Widgets Inc.
+Invoice Number: INV-2024
+Date: 2026-01-22
+Due Date: 2026-02-21
+
+Items:
+  SteelBracket   qty: 12   unit price: $45.00
+
+Subtotal: $540.00
+Tax (0%): $0.00
+Total Amount: $540.00
+
+Payment Terms: Net 30

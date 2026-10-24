@@ -91,6 +91,10 @@ def _to_invoice(extracted: ExtractedInvoice, path: Path, source: str) -> Invoice
         setattr(inv, name, data[name])
     inv.currency = (data["currency"] or "USD").upper()
     inv.extras = data["extras"]
+    # Models return free-form extras; coerce the one key the code relies on.
+    former = inv.extras.get("former_names")
+    if isinstance(former, str):
+        inv.extras["former_names"] = [former]
     return inv
 
 
@@ -117,8 +121,21 @@ def llm_extract(
     raise ExtractionFailed("could not produce a grounded extraction: " + "; ".join(errors))
 
 
+def _recognizable(result: IngestResult) -> IngestResult:
+    """An extraction with no vendor, number, total or lines means we could not
+    read the document, which is different from the invoice being invalid: send
+    it to a human instead of rejecting it for 'missing vendor'."""
+    inv = result.invoice
+    if not (inv.vendor or inv.invoice_number or inv.total is not None or inv.line_items):
+        raise ExtractionFailed("no invoice data could be recognized in the file")
+    return result
+
+
 def ingest(path: str | Path, provider: Provider, settings: Settings = SETTINGS) -> IngestResult:
-    path = Path(path)
+    return _recognizable(_ingest(Path(path), provider, settings))
+
+
+def _ingest(path: Path, provider: Provider, settings: Settings) -> IngestResult:
     use_llm = not provider.is_mock
     hint = None
 
@@ -138,6 +155,12 @@ def ingest(path: str | Path, provider: Provider, settings: Settings = SETTINGS) 
     if use_llm:
         try:
             inv, attempts = llm_extract(path, source, provider, settings, hint)
+            if hint and not (inv.vendor and inv.total is not None and inv.line_items):
+                # The file was malformed and the fallback recovered only part of it.
+                # Missing fields here mean we could not read it, not that the invoice
+                # is invalid, so a human should look rather than validation rejecting it.
+                raise ExtractionFailed(
+                    f"the file is malformed ({hint}) and the fallback extraction is incomplete")
             return IngestResult(inv, "llm-fallback" if hint else "llm", attempts)
         except LLMError as exc:
             log.info("LLM extractor unavailable (%s); using rule-based extractor", exc)

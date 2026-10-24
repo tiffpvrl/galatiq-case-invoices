@@ -132,7 +132,7 @@ def test_cli_all_processes_every_sample_file(cli_db, capsys):
     cli.main(["--all", "--fresh", "--json", "--db", cli_db])
     out = json.loads(capsys.readouterr().out)
     assert out["summary"]["invoices"] == len(list(INVOICE_DIR.iterdir()))
-    assert out["summary"]["paid"] == 6
+    assert out["summary"]["paid"] == 5
 
 
 def test_cli_without_a_source_prints_usage_and_exits_2(cli_db, capsys):

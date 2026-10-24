@@ -1,0 +1,213 @@
+{
+  "cases": [
+    {
+      "file": "tc01_small_clean.json",
+      "outcome": "PAID",
+      "why": "Small clean invoice: approved by code, no LLM call (the samples have none under $1K).",
+      "must_include": [],
+      "approver_called": false
+    },
+    {
+      "file": "tc02_exactly_10k.json",
+      "outcome": "PAID",
+      "why": "Total exactly at the $10,000 scrutiny threshold: the approver/critic loop runs.",
+      "must_include": [],
+      "approver_called": true
+    },
+    {
+      "file": "tc03_near_threshold.json",
+      "outcome": "PAID",
+      "why": "$9,990 sits just under $10K: NEAR_THRESHOLD is flagged and weighed, not blocking.",
+      "must_include": [
+        "NEAR_THRESHOLD"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc04_large_clean.json",
+      "outcome": "PAID",
+      "why": "Clean invoice over $10K: exercises the large-invoice reflection path.",
+      "must_include": [],
+      "approver_called": true
+    },
+    {
+      "file": "tc05_over_cfo_limit.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "$52,920 exceeds the $50K CFO tier: escalated by the floor, approver never called.",
+      "must_include": [
+        "OVER_CFO_THRESHOLD"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc21_stock_exactly_available.json",
+      "outcome": "PAID",
+      "why": "Billing exactly the 15 on hand passes (boundary: stock check is >, not >=).",
+      "must_include": [],
+      "approver_called": false
+    },
+    {
+      "file": "tc22_stock_one_over.json",
+      "outcome": "REJECTED",
+      "why": "One unit over stock hard-fails.",
+      "must_include": [
+        "INSUFFICIENT_STOCK"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc23_late_but_clean.json",
+      "outcome": "PAID",
+      "why": "Past due but otherwise clean: lateness is a flag, not a reason to refuse payment.",
+      "must_include": [
+        "PAST_DUE"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc09_price_within_tolerance.json",
+      "outcome": "PAID",
+      "why": "+1% over list is inside the 2% tolerance.",
+      "must_include": [],
+      "approver_called": false
+    },
+    {
+      "file": "tc10_price_5pct_over.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "+5% over list with no explanation: flagged and the approver cannot justify it.",
+      "must_include": [
+        "PRICE_ABOVE_LIST"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc11_total_overcharge.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Stated total is $100 above lines + tax: an overcharge a human should dispute.",
+      "must_include": [
+        "TOTAL_MISMATCH"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc12_total_shortfall.json",
+      "outcome": "PAID",
+      "why": "Total is $50 below lines: a shortfall costs Acme nothing, so it is flagged but payable.",
+      "must_include": [
+        "TOTAL_MISMATCH"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc06_unknown_vendor.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Otherwise clean, but the vendor is not in the master.",
+      "must_include": [
+        "UNKNOWN_VENDOR"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc07_urgency_language.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Manufactured urgency on an otherwise clean invoice.",
+      "must_include": [
+        "PRESSURE_LANGUAGE"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc08_prompt_injection.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Prompt injection in a free-text field: caught by the floor in code, so no model is ever asked to resist it.",
+      "must_include": [
+        "PRESSURE_LANGUAGE"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc14_number_collision.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "INV-2001 was already used by Widgets Inc. (tc01).",
+      "must_include": [
+        "INVOICE_NUMBER_COLLISION"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc13_duplicate_of_tc01.csv",
+      "outcome": "REJECTED",
+      "why": "Same invoice as tc01 arriving as a CSV: caught by the content hash, not the file bytes.",
+      "must_include": [
+        "DUPLICATE_INVOICE"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc15_name_variants.json",
+      "outcome": "PAID",
+      "why": "Case/whitespace variants of vendor and item names still match (no fuzzy matching).",
+      "must_include": [],
+      "approver_called": false
+    },
+    {
+      "file": "tc16_near_miss_item.json",
+      "outcome": "REJECTED",
+      "why": "WidgetD is one edit from WidgetA/B/C: it must stay unknown, with a hint only.",
+      "must_include": [
+        "UNKNOWN_ITEM"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc17_malformed.json",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Truncated JSON: unreadable is not invalid, so a human looks at it.",
+      "must_include": [
+        "EXTRACTION_FAILED"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc18_garbage.txt",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "Nothing recognizable: not rejected for 'missing vendor', sent to a human.",
+      "must_include": [
+        "EXTRACTION_FAILED"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc20_missing_invoice_number.json",
+      "outcome": "REJECTED",
+      "why": "No invoice number: cannot be audited or checked for duplicates (vendor can resubmit).",
+      "must_include": [
+        "MISSING_INVOICE_NUMBER"
+      ],
+      "approver_called": false
+    },
+    {
+      "file": "tc19_ambiguous_date.csv",
+      "outcome": "NEEDS_HUMAN_REVIEW",
+      "why": "03/04/2026 is March 4th or April 3rd: flagged instead of guessed.",
+      "must_include": [
+        "AMBIGUOUS_DATE"
+      ],
+      "approver_called": true
+    },
+    {
+      "file": "tc24_plain_text.txt",
+      "outcome": "PAID",
+      "why": "A clean text invoice through the text extractor.",
+      "must_include": [],
+      "approver_called": false
+    },
+    {
+      "file": "tc26_clean.xml",
+      "outcome": "PAID",
+      "why": "A clean XML invoice through the XML parser.",
+      "must_include": [],
+      "approver_called": false
+    }
+  ]
+}

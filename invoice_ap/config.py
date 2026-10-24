@@ -49,6 +49,16 @@ class Policy:
         "avoid penalties",
         "act now",
         "final notice",
+        # Authority claims and prompt-injection attempts. The floor escalates
+        # on these in code, before any model sees the invoice.
+        "ignore previous instructions",
+        "ignore all previous",
+        "pre-approved",
+        "already approved",
+        "authorized by",
+        "without review",
+        "skip review",
+        "do not verify",
     )
 
 

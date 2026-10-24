@@ -19,7 +19,7 @@ EXPECTED = [
     ("invoice_1007.csv", R),   # stock shortfall on two items
     ("invoice_1008.txt", R),   # unknown items
     ("invoice_1009.json", R),  # negative quantity and total, no vendor
-    ("invoice_1010.txt", P),   # rush premium is explained and under 5% of the invoice
+    ("invoice_1010.txt", H),   # rush premium is only the sender's claim: unverified
     ("invoice_1011.txt", P),
     ("invoice_1011.pdf", R),   # duplicate of the txt
     ("invoice_1012.txt", H),   # vendor renamed
@@ -52,7 +52,7 @@ def test_every_sample_file_is_covered():
 def test_total_paid_matches_the_paid_invoices(conn):
     results = run_all(conn)
     paid = sum(r.invoice.total for r in results.values() if r.outcome == P)
-    assert paid == 5000 + 1890 + 2750 + 7185 + 3000 + 6500
+    assert paid == 5000 + 1890 + 2750 + 3000 + 6500
 
 
 def test_no_invoice_with_a_hard_fail_is_ever_paid(conn):

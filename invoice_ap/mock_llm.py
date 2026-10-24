@@ -62,17 +62,12 @@ class MockProvider:
         for f in warnings:
             if f["code"] != "PRICE_ABOVE_LIST":
                 continue
+            # Check the catalog, but a note on the line is the sender's own claim, not
+            # verification (there is no PO to check it against), so never accept it.
             list_price = by_name["get_catalog_price"].fn(item=f.get("item")).get("unit_price")
-            # The same item can appear on several lines; judge the overpriced ones.
-            over = [l for l in inv["line_items"] if l["item"] == f.get("item")
-                    and list_price and (l.get("unit_price") or 0) > list_price]
-            if not over or not all(l.get("note") for l in over):
-                return verdict(Decision.ESCALATE,
-                               "Price above catalog with no explanation on the line.")
-            premium = sum((l["unit_price"] - list_price) * l["quantity"] for l in over)
-            if premium > 0.05 * total:
-                return verdict(Decision.ESCALATE, f"Premium ${premium:,.2f} over catalog is "
-                               "more than 5% of the invoice.")
+            return verdict(Decision.ESCALATE,
+                           f"Price above the ${list_price:,.2f} catalog price; any explanation on "
+                           "the line is an unverified claim from the vendor.")
 
         return verdict(Decision.APPROVE,
                        "Remaining flags are explained or immaterial; verified catalog pricing "
