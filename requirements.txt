@@ -1,0 +1,7 @@
+pydantic>=2.7
+pdfplumber>=0.11
+openai>=1.50
+python-dotenv>=1.0
+rich>=13.7
+pytest>=8.0
+defusedxml>=0.7

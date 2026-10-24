@@ -53,7 +53,7 @@ Guards found in the sample data:
 - **OCR-style typos:** `26-Jan-2O26` and `$3,500.O0` (letter O) in INV-1012 must not fail grounding.
 - **Past-due checks:** use a configurable as-of date. Every sample is dated January 2026, so the wall clock would flag nearly all of them. Resolve "yesterday" (INV-1003) against the invoice date.
 - **Absent fields:** a field missing from the source (INV-1009 vendor) is never "re-extracted"; the LLM would invent it.
-- **Other traps:** INV-1007's total is wrong (14,750 + 885 tax = 15,635, stated 15,525); INV-1010 bills a rush WidgetA at $300 vs. $250 catalog (+20%); INV-1014 is in EUR with prices 5–10% under catalog.
+- **Other traps:** INV-1007's total is wrong (14,750 + 885 tax = 15,635, stated 15,525); INV-1013's total is also wrong (21,040 + 1,472.80 tax = 22,512.80, stated 22,562.80, a $50 overcharge; found by the validator, not by hand); INV-1010 bills a rush WidgetA at $300 vs. $250 catalog (+20%); INV-1014 is in EUR with prices 5–10% under catalog.
 
 ### Price tolerance
 

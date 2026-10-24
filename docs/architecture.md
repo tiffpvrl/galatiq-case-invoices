@@ -27,7 +27,9 @@ flowchart TD
 
     INV{"Inventory and price validation<br/>(code, SQLite)"}
     INV -->|"hard fail"| REJECT["Reject<br/>log reasons<br/>(code)"]
-    INV -->|"pass"| NEED{"Flags present<br/>or total over $10K?<br/>(code)"}
+    INV -->|"pass"| FLOOR{"Policy floor<br/>(code)<br/>identity / pressure flags,<br/>revisions, FX, over $50K"}
+    FLOOR -->|"escalate: approver never called"| HUMAN
+    FLOOR -->|"ok"| NEED{"Flags present<br/>or total over $10K?<br/>(code)"}
 
     NEED -->|"no: clean"| AUTO["Auto-approve<br/>templated rationale<br/>(code)"]
     NEED -->|"yes"| APPROVE
@@ -54,7 +56,7 @@ flowchart TD
     classDef llm fill:#dbeafe,stroke:#1d4ed8,color:#111;
     classDef code fill:#f3f4f6,stroke:#6b7280,color:#111;
     class EXTRACT,APPROVE,CRITIC,NOTIFY llm;
-    class ROUTE,PARSE,GROUND,DUP,INV,NEED,AUTO,GATE,REJECT,PAY code;
+    class ROUTE,PARSE,GROUND,DUP,INV,FLOOR,NEED,AUTO,GATE,REJECT,PAY code;
 ```
 
 ## Why each step is an agent or plain code
@@ -71,7 +73,7 @@ An LLM is used only where the step needs to interpret ambiguity or reason in lan
 | Auto-approve of clean invoices | Code | Nothing to weigh: no flags and not over $10K. An LLM here adds cost and non-determinism without adding information |
 | Approver | **LLM agent** | Weighs mixed evidence (flags, amount, vendor, fraud language) and writes a rationale. Runs only when there is something to weigh |
 | Critic | **LLM agent** | Adversarial second pass catches missed flags and inconsistent reasoning. This is the reflection loop the case requires |
-| Policy gate | Code | Deterministic override after the loop: certain flags force escalation whatever the LLM said |
+| Policy floor and gate | Code | The floor runs before the LLM: identity, pressure, revision and FX flags (`policy.FORCE_ESCALATE`) and totals over $50K escalate without calling the approver, since it could not change the outcome. The final decision is `most_cautious(floor, LLM)`, so the LLM can only be more cautious |
 | Payment, reject | Code | Side effects must be deterministic and only run on an explicit approval |
 | Notification writer | **LLM agent** | Turns structured reasons into a clear human-readable message. Lowest risk, so it is the first thing to cut if time is short |
 
@@ -125,7 +127,7 @@ Invoice text is untrusted. The approver sees structured fields and findings, not
 
 ## LLM provider
 
-Anthropic Claude through a thin provider interface (`src/llm.py`). A mock provider returns canned structured responses so tests and demos run offline and deterministically. A stronger model for the approver and critic and a cheaper one for extraction and notifications are config choices. An OpenAI-compatible adapter can be added later without touching the agents.
+xAI Grok (the case's specified engine) through its OpenAI-compatible API, behind a thin provider interface (`invoice_ap/llm.py`). Agents never import an SDK, so another OpenAI-compatible provider needs only a different base URL and key. A mock provider returns canned structured responses so tests and demos run offline and deterministically. The most capable model goes to the approver and critic and a cheaper non-reasoning one to extraction and notifications; model IDs are overridable per role with `AP_MODEL_<ROLE>`.
 
 ## Observability
 
