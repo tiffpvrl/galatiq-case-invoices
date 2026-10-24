@@ -20,7 +20,8 @@ from .extract import ExtractionFailed, IngestResult, ingest
 from .ledger import content_hash, record
 from .llm import Provider, Usage
 from .models import Decision, Finding, Invoice, Outcome, Severity
-from .notify import Notification, write_notification
+from .notify import Notification, vendor_draft, write_notification
+from .routing import suggest_owner
 from .payment import PaymentResult, mock_payment, pay
 from .policy import needs_reasoning, most_cautious, rule_floor
 from .trace import Trace
@@ -41,6 +42,9 @@ class Result:
     approval: ApprovalResult | None = None
     payment: PaymentResult | None = None
     notification: Notification | None = None
+    vendor_draft: Notification | None = None
+    owner: str | None = None  # suggested owner of a held invoice
+    owner_why: list[str] = field(default_factory=list)
     usage: list[Usage] = field(default_factory=list)
     duration_ms: float = 0.0
     trace: list[dict] = field(default_factory=list)
@@ -68,7 +72,9 @@ class Result:
             "input_tokens": sum(u.input_tokens for u in self.usage),
             "output_tokens": sum(u.output_tokens for u in self.usage),
             "duration_ms": self.duration_ms,
+            "owner": self.owner,
             "notification": self.notification.model_dump() if self.notification else None,
+            "vendor_draft": self.vendor_draft.model_dump() if self.vendor_draft else None,
         }
 
 
@@ -104,19 +110,25 @@ def process_file(
             record(conn, run_id, result.invoice, outcome, result.reasons)
         except Exception as exc:  # ledger failure must not hide the outcome
             trace.event("ledger_error", error=str(exc))
+        if outcome == Outcome.NEEDS_HUMAN_REVIEW:
+            result.owner, result.owner_why = suggest_owner(result.reasons, result.invoice.total, settings)
         facts = {
             "outcome": outcome.value, "invoice_number": result.invoice.invoice_number,
             "vendor": result.invoice.vendor, "total": result.invoice.total,
             "source_file": path.name, "rationale": rationale, "reasons": result.reasons,
             "payment": result.payment.reference if result.payment else None,
+            "owner": result.owner, "owner_why": result.owner_why,
         }
         with trace.stage("notify"):
             result.notification = write_notification(facts, provider)
+            result.vendor_draft = vendor_draft(facts)
         if out_dir:
             note_dir = out_dir / "notifications"
             note_dir.mkdir(parents=True, exist_ok=True)
-            n = result.notification
-            (note_dir / f"{path.stem}.txt").write_text(f"Subject: {n.subject}\n\n{n.body}\n")
+            for suffix, note in (("", result.notification), (".vendor", result.vendor_draft)):
+                if note:
+                    (note_dir / f"{path.stem}{suffix}.txt").write_text(
+                        f"To: {note.to}\nSubject: {note.subject}\n\n{note.body}\n")
         result.usage = provider.usage[usage_start:]
         result.duration_ms = round((time.perf_counter() - started) * 1000, 1)
         trace.event("done", outcome=outcome.value, llm_calls=result.llm_calls,

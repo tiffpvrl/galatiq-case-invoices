@@ -4,14 +4,14 @@ Rules and thresholds referenced here are justified in [process-notes.md](process
 
 ## Flow
 
-Blue nodes are LLM agents. Grey nodes are plain code. Every node writes to the audit log.
+Blue nodes are LLM agents, grey nodes are plain code, and amber nodes are where a person acts. Every step is recorded in the ledger and the trace.
 
 ```mermaid
 flowchart TD
-    IN([Invoice file<br/>txt / pdf / json / csv / xml]) --> ROUTE["Format router<br/>(code)"]
+    IN([Invoice file<br/>txt / pdf / json / csv / xml]) --> FMT["Format router<br/>(code)"]
 
-    ROUTE -->|"json / csv / xml"| PARSE["Deterministic parser<br/>(code)"]
-    ROUTE -->|"txt / pdf"| EXTRACT["Extractor agent<br/>(LLM, structured output)"]
+    FMT -->|"json / csv / xml"| PARSE["Deterministic parser<br/>(code)"]
+    FMT -->|"txt / pdf"| EXTRACT["Extractor agent<br/>(LLM, structured output)"]
     PARSE -->|"parse error or invalid schema"| EXTRACT
 
     EXTRACT --> GROUND{"Grounding check<br/>(code)<br/>values in source?"}
@@ -45,18 +45,24 @@ flowchart TD
     GATE -->|"escalate or no agreement"| HUMAN["Human review queue"]
     GATE -->|"rejected"| REJECT
 
-    AUTO --> PAY["Mock payment<br/>(code)"]
+    AUTO --> PAY["Payment<br/>(code, idempotent)"]
     PAY -->|success| NOTIFY
     PAY -->|failure| HUMAN
     REJECT --> NOTIFY
-    HUMAN --> NOTIFY["Notification writer<br/>(LLM)<br/>email to human, saved to file"]
+    HUMAN --> OWNER["Suggested owner<br/>(code: routing table)"]
+    OWNER --> NOTIFY["Notification drafts, never sent<br/>LLM for held and rejected,<br/>template for paid,<br/>vendor correction draft when<br/>the vendor can fix it"]
 
-    NOTIFY --> AUDIT[("SQLite audit log<br/>+ JSON-lines trace")]
+    NOTIFY --> LEDGER[("SQLite ledger<br/>+ JSON-lines trace")]
+    LEDGER --> REPORT["AP queues report<br/>(HTML snapshot: needs review,<br/>ready to pay, rejected)"]
+    LEDGER --> REVIEW["Review queue (CLI)<br/>approve, reject or hold;<br/>a revision pays only the difference"]
+    REVIEW --> INSIGHTS["Insights<br/>(suggested policy changes)"]
 
     classDef llm fill:#dbeafe,stroke:#1d4ed8,color:#111;
     classDef code fill:#f3f4f6,stroke:#6b7280,color:#111;
+    classDef person fill:#fef3c7,stroke:#b45309,color:#111;
     class EXTRACT,APPROVE,CRITIC,NOTIFY llm;
-    class ROUTE,PARSE,GROUND,DUP,INV,FLOOR,NEED,AUTO,GATE,REJECT,PAY code;
+    class FMT,PARSE,GROUND,DUP,INV,FLOOR,NEED,AUTO,GATE,REJECT,PAY,OWNER,LEDGER,REPORT,INSIGHTS code;
+    class HUMAN,REVIEW person;
 ```
 
 ## Why each step is an agent or plain code
@@ -75,7 +81,11 @@ An LLM is used only where the step needs to interpret ambiguity or reason in lan
 | Critic | **LLM agent** | Adversarial second pass catches missed flags and inconsistent reasoning. This is the reflection loop the case requires |
 | Policy floor and gate | Code | The floor runs before the LLM: identity, pressure, revision and FX flags (`policy.FORCE_ESCALATE`) and totals over $50K escalate without calling the approver, since it could not change the outcome. The final decision is `most_cautious(floor, LLM)`, so the LLM can only be more cautious |
 | Payment, reject | Code | Side effects must be deterministic and only run on an explicit approval |
-| Notification writer | **LLM agent** | Turns structured reasons into a clear human-readable message. Lowest risk, so it is the first thing to cut if time is short |
+| Suggested owner | Code | A lookup from reason code to role (Treasury for FX, Buyer for price disputes, Controller for fraud signals, VP or CFO by amount). The most senior applicable role wins. A suggestion, not an access control |
+| Notification drafts | **LLM agent** for held and rejected invoices; template for paid | Turns structured reasons into a clear message for the owner. A paid invoice has nothing to explain, so it costs no model call. Drafts are saved, never sent |
+| Vendor correction request | Code (template) | Only when every hard-fail reason is one the vendor can fix and no identity or pressure flag is present. A template promises nothing we did not check; an AP clerk reviews before anything is sent |
+| AP queues report | Code | A static, self-contained HTML snapshot of the three queues for the people who work them. All invoice text is escaped |
+| Review queue and insights | Code and a person | The human decision is recorded; insights turn those decisions into suggested policy changes, never applied automatically |
 
 Safety properties:
 - A hard-failed invoice never reaches the approver.

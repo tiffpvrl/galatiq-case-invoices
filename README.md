@@ -7,9 +7,9 @@ The original case brief is in [docs/CASE.md](docs/CASE.md).
 **The short version**
 
 - **Most of the system is plain code, on purpose.** Arithmetic, stock lookups and duplicate checks are exact, so they run as code. An LLM is called only where there is ambiguity to reason about: reading messy text, weighing flagged invoices, and a second-opinion review.
-- **A clean invoice costs zero model calls to approve.** On the 20 sample files the live run averaged 1.55 LLM calls per invoice (including the notification email).
+- **A clean invoice costs zero model calls, start to finish.** It is approved, paid and notified by code. Across the 20 sample files the live run averaged 1.3 model calls per invoice, because the model also reads messy text and writes the notes for held and rejected invoices.
 - **The model can only make a decision more cautious.** A deterministic policy floor runs first and the model can never override it.
-- **It was evaluated, not just demoed.** 70 live runs of the judgment cases produced 0 unsafe approvals (details below), and 216 tests pass.
+- **It was evaluated, not just demoed.** 70 live runs of the judgment cases produced 0 unsafe approvals (details below), and 235 tests pass.
 
 ## Quick start
 
@@ -21,10 +21,10 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 python main.py --invoice_path=data/invoices/invoice_1001.txt   # one invoice, full detail
-python main.py --all --fresh                                    # all sample invoices, clean ledger
+python main.py --all --fresh --open                             # all samples, then open the HTML report
 python main.py --review                                         # resolve escalated invoices
 python main.py --insights                                       # policy suggestions from review decisions
-pytest                                                          # 216 tests, about 11 seconds
+pytest                                                          # 235 tests, about 12 seconds
 ```
 
 With no API key, everything runs on an **offline mock provider** (rule-based extraction, canned reasoning), so these commands work immediately. For real model reasoning, copy `.env.example` to `.env` and set one of:
@@ -36,7 +36,7 @@ With no API key, everything runs on an **offline mock provider** (rule-based ext
 
 I tested the system using Claude, since that was the API available to me. It's built for Grok's API as the case specifies (set `XAI_API_KEY`), and runs on any OpenAI-compatible endpoint (see `.env.example`).
 
-Other useful flags: `--json` (machine-readable), `--brief` (one line per invoice), `--offline` (force the mock), `--provider grok|custom|mock`, `--reserve-stock`, `--as-of YYYY-MM-DD`, `-v` (structured trace to stderr). Each run writes a JSON-lines trace and the generated notification emails to `runs/<run-id>/`.
+Other useful flags: `--json` (machine-readable), `--brief` (one line per invoice), `--offline` (force the mock), `--provider grok|custom|mock`, `--reserve-stock`, `--as-of YYYY-MM-DD`, `-v` (structured trace to stderr), `--open` (open the HTML report), `--no-report`. Each run writes `runs/<run-id>/report.html`, a JSON-lines trace, and the notification drafts (nothing is ever sent).
 
 The SQLite inventory is created and seeded automatically on first run. The four starter rows from the brief are unchanged; three extra SKUs let a clean invoice over $10K exist for testing.
 
@@ -44,9 +44,9 @@ The SQLite inventory is created and seeded automatically on first run. The four 
 
 ```mermaid
 flowchart TD
-    IN([Invoice file]) --> ROUTE["Format router<br/>(code)"]
-    ROUTE -->|"json, csv, xml"| PARSE["Parser<br/>(code)"]
-    ROUTE -->|"txt, pdf"| EXTRACT["Extractor<br/>(LLM + grounding check)"]
+    IN([Invoice file]) --> FMT["Format router<br/>(code)"]
+    FMT -->|"json, csv, xml"| PARSE["Parser<br/>(code)"]
+    FMT -->|"txt, pdf"| EXTRACT["Extractor<br/>(LLM + grounding check)"]
     PARSE -->|"parse error"| EXTRACT
     PARSE --> VALIDATE
     EXTRACT --> VALIDATE
@@ -69,8 +69,13 @@ flowchart TD
 
     PAY --> NOTIFY
     REJECT --> NOTIFY
-    HUMAN --> NOTIFY["Notification email<br/>(LLM)"]
+    HUMAN --> OWNER["Suggested owner<br/>(routing table)"]
+    OWNER --> NOTIFY["Notification drafts, never sent<br/>(LLM for held and rejected,<br/>template for paid)"]
     NOTIFY --> LEDGER[("SQLite ledger<br/>+ JSON trace")]
+
+    LEDGER --> REPORT["AP queues report<br/>(HTML: needs review,<br/>ready to pay, rejected)"]
+    LEDGER --> REVIEW["Review queue<br/>(a person approves,<br/>rejects or holds)"]
+    REVIEW --> INSIGHTS["Insights<br/>(suggested policy changes)"]
 ```
 
 Every invoice ends in exactly one of three outcomes: **Paid**, **Rejected** (with reasons), or **Needs human review** (with reasons).
@@ -88,7 +93,8 @@ Every invoice ends in exactly one of three outcomes: **Paid**, **Rejected** (wit
 | Approver | **LLM agent** | Weighs mixed evidence, verifies claims with five read-only tools |
 | Critic | **LLM agent** | An independent second reviewer who must cite a real finding to object (maker/checker) |
 | Payment, rejection | Code | Side effects must be deterministic |
-| Notification email | **LLM agent** | Phrases facts it is given; falls back to a template |
+| Notification drafts | **LLM agent** for held and rejected; template for paid | Phrases facts it is given for the person who must act; a paid invoice has nothing to explain, so it costs no model call |
+| Suggested owner, vendor correction request, HTML report | Code | A routing table, a template, and a static report: nothing here needs a model |
 
 ### Agentic capabilities the brief asks for
 
@@ -104,6 +110,37 @@ Every invoice ends in exactly one of three outcomes: **Paid**, **Rejected** (wit
 - The approver sees structured fields only, never the raw document. Invoice free text is passed as labeled untrusted data, and known injection phrasing is caught in code before any model runs.
 - Payment is idempotent. Re-running a file cannot pay twice.
 - "Unreadable" is never treated as "invalid". A garbled or truncated file goes to a person, not to rejection.
+
+## How this fits Acme's process
+
+In practice this runs in the background and the AP team works from queues, not from a command line.
+
+| Who | What they use it for |
+|---|---|
+| **AP clerks** | Work the *needs review* queue. The job shifts from keying data to resolving exceptions |
+| **AP manager / controller** | Watch volume, how much escalates, and the money held. Tune the rules using the insights report |
+| **VP / CFO** | See only what crosses their approval tier ($10K, and $50K for the CFO) |
+| **Treasury** | Handle foreign-currency invoices and release payments |
+| **Buyers and vendor management** | Settle price disputes and vendor-master questions routed to them |
+| **Auditors** | Read the trace and ledger: who decided what, and why |
+
+**The intended flow.** Invoices arrive in a shared AP inbox, a supplier portal or an EDI feed. A watcher runs each one through the pipeline as it lands. Every invoice ends in one of three queues:
+
+- **Ready to pay** feeds the next payment run. (Real AP releases payments in scheduled batches, often by a separate person. The prototype pays immediately with a mock call.)
+- **Needs review** is a work queue, and each item names the role best placed to resolve it: Treasury for FX, the buyer for a price dispute, the controller for a suspected re-bill, the CFO above $50K.
+- **Rejected** is blocked with its reasons. When every reason is one the vendor can fix, a correction request is drafted for an AP clerk to review. Possible fraud is never auto-contacted.
+
+**Notifications.** A pop-up per invoice would bury people, so the design is a queue with counts as the main surface, an alert only for items needing action now, and a digest for the manager. The system writes the message content (to the suggested owner) as drafts. It never sends anything.
+
+**What exists here and what production adds.**
+
+| This prototype | Production would add |
+|---|---|
+| A CLI plus a static HTML report of the three queues, with suggested owners | A live workbench with sign-in, roles and an assignment workflow |
+| Files read from a folder | Inbox, supplier portal and EDI intake, watching continuously |
+| Mock payment, immediate | Scheduled payment runs and a release step by a second person |
+| Notification and vendor drafts saved as files | Delivery by email or chat, an SLA clock on each queue, and a daily digest |
+| An inventory table standing in for POs and receipts | Real PO and goods-receipt matching, and ERP posting |
 
 ## Domain reasoning
 
@@ -156,23 +193,27 @@ The first evaluation scored 95% with an inconsistent case. Reading the critic's 
 
 - **Speed.** The live run took about 4 seconds per invoice, against a baseline of days.
 - **Control.** 80% of sample invoices were resolved without a person. The rest went to review with the reasons and evidence attached.
-- **Token cost.** The 20-sample live run used about 37K input and 16K output tokens (1.55 model calls per invoice). Set `AP_PRICE_IN_PER_MTOK` and `AP_PRICE_OUT_PER_MTOK` in `.env` and the run summary shows dollars per invoice. The industry average cost to process an invoice manually is roughly $9–10; sources are vendor blogs, so treat that as directional.
+- **Token cost.** The 20-sample live run used about 36K input and 18K output tokens (1.3 model calls per invoice). Set `AP_PRICE_IN_PER_MTOK` and `AP_PRICE_OUT_PER_MTOK` in `.env` and the run summary shows dollars per invoice. The industry average cost to process an invoice manually is roughly $9–10; sources are vendor blogs, so treat that as directional.
 - **Caution on extrapolation.** The sample set is deliberately adversarial (about half the invoices are bad), so these numbers show that the controls work, not what Acme would save. A savings estimate needs Acme's real invoice mix.
 
 ## Testing
 
-216 tests, about 11 seconds, no network:
+235 tests, about 12 seconds, no network:
 
 - **Golden outcomes** for all 20 sample files and 31 extra cases ([data/test_cases/](data/test_cases/), generated by [scripts/generate_test_cases.py](scripts/generate_test_cases.py), each with a documented purpose): boundaries at exactly $10,000 and exactly the stock on hand, duplicates across file formats, near-miss item names, malformed and garbage files, prompt injection, re-billing under a new invoice number, and more.
 - **Agent mechanics** with scripted providers: loop bounds, citation rules, extraction retry, tool-use loops.
 - **Wire-level tests** for Grok: a local HTTP server using xAI's documented response shapes, driven by the real `openai` SDK.
 - **Safety invariants**: never pay on error, never pay a hard fail, idempotent payment.
 
-## Human in the loop
+## The report and the review queue
 
-`python main.py --review` is an interactive queue for escalated invoices: approve, reject or hold, with the reasons and evidence shown. Every decision is stored with a reviewer and note. Approving a revision pays only the difference.
+Every run writes a self-contained HTML report (`runs/<run-id>/report.html`, no network, works offline, light and dark themes, readable on a phone). It leads with a one-line summary for a manager, then the three queues: who each held invoice should go to, and for any invoice, the decision path, the reasons, the approver's reasoning and lookups, and the notification drafts. Everything that came from an invoice is escaped, because invoice text is untrusted.
 
-`python main.py --insights` turns those decisions into *suggested* policy changes, such as "reviewers approved every single-flag FX invoice, so consider letting the approver weigh it". It uses only single-flag invoices (otherwise a decision can't be attributed to a flag) and requires a statistical bar, so "5 of 5" doesn't move policy but "12 of 12" does. Suggestions are never applied automatically. There are no real reviewer decisions yet; `scripts/simulate_reviews.py` creates a separate demo database, and the report labels simulated data clearly.
+The report is a snapshot, and review stays in the terminal on purpose: a local web page that can approve payments is a security surface that does not belong in a prototype.
+
+`python main.py --review` is an interactive queue for escalated invoices: approve, reject or hold, with the reasons, the evidence and the suggested owner shown. Every decision is stored with a reviewer and note. Approving a revision pays only the difference.
+
+`python main.py --insights` turns those decisions into *suggested* policy changes, such as "reviewers approved every single-flag FX invoice, so consider letting the approver weigh it". It uses only single-flag invoices (otherwise a decision can't be attributed to a flag) and requires a statistical bar, so "5 of 5" doesn't move policy but "12 of 12" does. Suggestions are never applied automatically. There are no real reviewer decisions yet; `scripts/simulate_reviews.py` creates a separate demo database, and the insights output labels simulated data clearly.
 
 ## Limitations and next steps
 
@@ -184,7 +225,7 @@ The first evaluation scored 95% with an inconsistent case. Reading the critic's 
 - **Evaluation is small and the labels are mine.** 14 cases, one provider, and ambiguous cases accept several decisions. It shows the approach works and gives a repeatable method, not a proof.
 - **The critic never objected in the final evaluation.** It was valuable for finding the two gaps above; whether it earns its roughly 25% share of approval calls ongoing is open. A config lever exists to restrict it to high-stakes invoices.
 - **A model can reject outright.** The LLM sometimes rejects an overcharged invoice instead of escalating it. Both are safe, but a stricter policy would let only humans reject.
-- **Review is synchronous**, and there is no web UI. The next steps would be asynchronous review, an HTML run report, and learning thresholds from real reviewer decisions.
+- **Review is synchronous and in the terminal,** and the report is a static snapshot, not a live app. The next steps are asynchronous review with assignments, delivery of the drafts, and learning thresholds from real reviewer decisions.
 
 ## Repository layout
 
@@ -200,14 +241,16 @@ invoice_ap/
   policy.py              the policy floor the model cannot override
   approval.py            approver + critic reflection loop, tools
   llm.py / mock_llm.py   LLM providers and the offline mock
-  payment.py, ledger.py, db.py, tools.py, notify.py, trace.py
+  payment.py, ledger.py, db.py, tools.py, trace.py
+  routing.py, notify.py  suggested owner, notification and vendor drafts
+  html_report.py         the AP queues report
   review.py, insights.py human review queue, policy suggestions
   evals.py               model evaluation harness
   config.py              every threshold, with rationale
 scripts/                 check_llm, eval_judgment, generate_test_cases, simulate_reviews
 data/invoices/           the 20 provided invoices
 data/test_cases/         31 extra cases + expected outcomes
-tests/                   216 tests
+tests/                   235 tests
 docs/                    CASE.md (the brief), architecture, process-notes, eval-results
 ```
 

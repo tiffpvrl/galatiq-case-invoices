@@ -6,12 +6,13 @@ always approve).
 """
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .ledger import content_hash
 from .models import Invoice, Outcome
 from .payment import PaymentResult, mock_payment, pay
+from .routing import suggest_owner
 
 DECISIONS = ("approve", "reject", "hold")
 
@@ -25,6 +26,8 @@ class PendingReview:
     source_file: str | None
     reasons: list[dict]
     created_at: str
+    owner: str = "AP clerk"
+    owner_why: list[str] = field(default_factory=list)
 
 
 class ReviewError(Exception):
@@ -41,9 +44,13 @@ def pending(conn: sqlite3.Connection) -> list[PendingReview]:
         " AND d.decision IN ('approve', 'reject')) ORDER BY p.id",
         (Outcome.NEEDS_HUMAN_REVIEW.value,),
     )
-    return [PendingReview(r["id"], r["invoice_number"], r["vendor"], r["total"],
-                          r["source_file"], json.loads(r["reasons"]), r["created_at"])
-            for r in rows]
+    queue = []
+    for r in rows:
+        reasons = json.loads(r["reasons"])
+        owner, why = suggest_owner(reasons, r["total"])
+        queue.append(PendingReview(r["id"], r["invoice_number"], r["vendor"], r["total"],
+                                   r["source_file"], reasons, r["created_at"], owner, why))
+    return queue
 
 
 def amount_due(conn: sqlite3.Connection, inv: Invoice, ledger_id: int) -> float:

@@ -22,6 +22,7 @@ from invoice_ap import review
 from invoice_ap import insights
 from invoice_ap.config import DB_PATH, INVOICE_DIR, RUN_DIR, SETTINGS
 from invoice_ap.db import init_db
+from invoice_ap.html_report import write_report
 from invoice_ap.llm import PROVIDERS, make_provider
 from invoice_ap.pipeline import process_file
 from invoice_ap.report import money, print_result, print_summary, summarize
@@ -52,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print machine-readable JSON, no styling")
     p.add_argument("--brief", action="store_true", help="one line per invoice")
     p.add_argument("--db", default=str(DB_PATH), help="SQLite database path")
+    p.add_argument("--open", action="store_true", help="open the HTML report in your browser when done")
+    p.add_argument("--no-report", action="store_true", help="do not write the HTML report")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="print the structured trace events to stderr")
     return p
@@ -84,6 +87,8 @@ def run_review(conn, console: Console) -> int:
         console.rule(f"#{item.ledger_id}  {escape(str(item.invoice_number or item.source_file))}")
         console.print(f"Vendor: {escape(str(item.vendor or 'unknown'))}   "
                       f"Total: {money(item.total)}   File: {escape(str(item.source_file))}")
+        console.print(f"Suggested owner: [bold]{escape(item.owner)}[/]"
+                      + (f" ({escape(', '.join(item.owner_why))})" if item.owner_why else ""))
         for r in item.reasons:
             console.print(f"  {r['severity']:<8} {escape(r['code'])}: {escape(r['message'])}")
         choice = Prompt.ask("Decision", choices=["approve", "reject", "hold", "quit"],
@@ -159,6 +164,10 @@ def main(argv=None) -> int:
         print_result(console, result, detail=not args.brief)
 
     summary = summarize(results, provider.name)
+    report_path = None
+    if not args.no_report:
+        report_path = write_report(out_dir / "report.html", results, run_id, provider.name,
+                                   provider.is_mock, settings.as_of_date)
     if args.json:
         print(json.dumps({"run_id": run_id, "summary": summary,
                           "invoices": [r.to_dict() for r in results]}, indent=2, default=str))
@@ -172,7 +181,13 @@ def main(argv=None) -> int:
                       "(affected invoices were handled safely):[/]")
         for w in problems:
             console.print(f"  [yellow]•[/] {escape(w)}")
-    console.print(f"\n[dim]trace, notifications: {out_dir}[/]")
+    console.print(f"\n[dim]trace and notification drafts: {out_dir}[/]")
+    if report_path:
+        console.print(f"[bold]AP queues report:[/] {report_path}")
+        if args.open:
+            import webbrowser
+
+            webbrowser.open(report_path.resolve().as_uri())
     held = summary["needs_review"]
     if held:
         console.print(f"[yellow]{held} invoice(s) await review: python main.py --review[/]")
