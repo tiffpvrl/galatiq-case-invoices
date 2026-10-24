@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+import main as cli
+
 from invoice_ap.approval import (
     ApproverVerdict,
     CriticVerdict,
@@ -466,3 +468,16 @@ def test_the_critic_is_shown_the_approvers_actual_lookup_results(inv, conn):
     critic_prompt = next(user for role, user in p.calls if role == "critic")
     assert "lookups_the_approver_ran" in critic_prompt
     assert '"tool": "get_vendor_history"' in critic_prompt and "window_days" in critic_prompt
+
+
+def test_a_missing_api_key_gives_an_actionable_error(clean_env):
+    from invoice_ap.llm import make_provider
+
+    for name, var in (("grok", "XAI_API_KEY"), ("anthropic", "ANTHROPIC_API_KEY")):
+        with pytest.raises(LLMError, match=f"{var} is not set"):
+            make_provider(name=name)
+
+
+def test_cli_reports_a_missing_key_cleanly(clean_env, tmp_path, capsys):
+    assert cli.main(["--all", "--provider", "grok", "--db", str(tmp_path / "t.db")]) == 2
+    assert "XAI_API_KEY is not set" in capsys.readouterr().err

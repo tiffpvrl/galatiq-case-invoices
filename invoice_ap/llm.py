@@ -104,6 +104,14 @@ def brief_error(exc: Exception, limit: int = 140) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _require_key(explicit: str | None, var: str, provider: str) -> str:
+    key = explicit or os.environ.get(var)
+    if not key:
+        raise LLMError(f"{var} is not set, so the {provider} provider cannot start. Add it to "
+                       ".env (see .env.example), or run with --offline to use the mock provider.")
+    return key
+
+
 def clean_schema(node):
     """Strip schema noise (title, default) that providers' tool-schema validators
     do not document, keeping everything meaningful. Property *names* such as a
@@ -312,7 +320,7 @@ class GrokProvider(OpenAICompatibleProvider):
             from openai import OpenAI
 
             client = OpenAI(
-                api_key=api_key or os.environ["XAI_API_KEY"],
+                api_key=_require_key(api_key, "XAI_API_KEY", "Grok"),
                 base_url=base_url or os.environ.get("XAI_BASE_URL", XAI_BASE_URL),
                 max_retries=3,  # the SDK retries transient errors with backoff
                 timeout=60.0,
@@ -338,7 +346,7 @@ class AnthropicProvider:
             import anthropic
 
             client = anthropic.Anthropic(
-                api_key=api_key or os.environ["ANTHROPIC_API_KEY"],
+                api_key=_require_key(api_key, "ANTHROPIC_API_KEY", "Anthropic"),
                 max_retries=3,  # the SDK retries transient errors with backoff
                 timeout=60.0,
             )
