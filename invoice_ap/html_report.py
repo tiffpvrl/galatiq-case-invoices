@@ -1,407 +1,676 @@
-"""A self-contained HTML snapshot of the AP queues for one run.
+"""A self-contained HTML report for one run: the AP queues, built for the people who work them.
 
-Organized the way an AP team works: a summary for the manager, then the three
-queues (needs review, ready to pay, rejected). Each held invoice names the
-person who should look at it. One file, no network, no dependencies, so it
-opens from a double-click. Everything that came from an invoice is HTML-escaped
-(invoice text is untrusted).
+The design (layout, type scale, colors, interaction model) comes from a design
+pass; this module generates the markup from real run data. One file, no network,
+no dependencies. Everything that came from an invoice is HTML-escaped (invoice
+text is untrusted), and the per-invoice detail panels live in inert <template>
+elements that the small script in report_assets/report.js clones on selection.
 """
 
 import datetime as dt
 import json
-from collections import defaultdict
+from collections import Counter
+from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
 
 from .models import Outcome
 from .pipeline import Result
-from .report import money, summarize
+from .policy import FRAUD_SIGNALS
 from .routing import ROLES
 
-OUTCOME_META = {
-    # outcome: (css class, icon, label)
-    Outcome.PAID: ("paid", "✓", "Paid"),
-    Outcome.NEEDS_HUMAN_REVIEW: ("review", "!", "Needs review"),
-    Outcome.REJECTED: ("rejected", "✕", "Rejected"),
+ASSETS = Path(__file__).parent / "report_assets"
+
+TONE = {Outcome.NEEDS_HUMAN_REVIEW: "review", Outcome.PAID: "paid", Outcome.REJECTED: "rejected"}
+GLYPH = {"review": "ring", "paid": "check", "rejected": "x"}
+
+# Plain-language one-liners for the queue rows; the full message is in the detail panel.
+PHRASES = {
+    "PRICE_ABOVE_LIST": "Priced above catalog",
+    "PRICE_BELOW_LIST": "Priced well below catalog",
+    "NEAR_THRESHOLD": "Just under an approval limit",
+    "VENDOR_RENAMED": "Vendor name differs from the master",
+    "UNKNOWN_VENDOR": "Vendor not in the vendor master",
+    "NON_SETTLEABLE_CURRENCY": "Billed in a currency we cannot settle",
+    "REVISION_OF_PRIOR": "Revision of an earlier invoice",
+    "POSSIBLE_REBILL": "Same bill as an earlier invoice",
+    "INVOICE_NUMBER_COLLISION": "Invoice number used by another vendor",
+    "PRESSURE_LANGUAGE": "Urgency or authority language",
+    "IMMEDIATE_TERMS": "Demands immediate payment",
+    "RELATIVE_DUE_DATE": "Due date given as a relative word",
+    "DUE_BEFORE_ISSUE": "Due date is before the invoice date",
+    "TOTAL_MISMATCH": "Total does not match the lines",
+    "SUBTOTAL_MISMATCH": "Subtotal does not match the lines",
+    "LINE_AMOUNT_MISMATCH": "A line amount does not match",
+    "INSUFFICIENT_STOCK": "Billed more than was received",
+    "OUT_OF_STOCK": "Item has no stock on hand",
+    "STOCK_CONTENTION": "Stock already claimed by other invoices",
+    "UNKNOWN_ITEM": "Item not in the catalog",
+    "DUPLICATE_INVOICE": "Identical to an invoice already processed",
+    "MISSING_VENDOR": "No vendor on the invoice",
+    "MISSING_INVOICE_NUMBER": "No invoice number",
+    "MISSING_TOTAL": "No total on the invoice",
+    "NON_POSITIVE_TOTAL": "Total is zero or negative",
+    "NEGATIVE_QUANTITY": "Negative quantity",
+    "NO_LINE_ITEMS": "No line items found",
+    "EXTRACTION_FAILED": "The file could not be read",
+    "OVER_CFO_THRESHOLD": "Over the CFO approval limit",
+    "FUTURE_DATED": "Dated in the future",
+    "AMBIGUOUS_DATE": "A date can be read two ways",
+    "MISSING_DUE_DATE": "No due date",
+    "PAST_DUE": "Already past due",
+    "PAYMENT_FAILED": "The payment call failed",
+    "INTERNAL_ERROR": "Unexpected error while processing",
 }
-SEVERITY_ICON = {"CRITICAL": "✕", "WARNING": "!", "INFO": "i"}
+
+GROUPS = {
+    # key: (label, note, glyph)
+    "fraud": ("Blocked: possible fraud", "Do not contact these senders. No correction request was drafted.", "tri"),
+    "fix": ("Fixable by vendor", "Correction requests are drafted for review.", "x"),
+    "dup": ("Duplicates", "Copies of invoices already processed. No action needed.", "x"),
+    "other": ("Invalid, not correctable", "Nothing the vendor can fix as billed.", "x"),
+}
+GROUP_ORDER = ["fraud", "fix", "dup", "other"]
+
+METHOD_TEXT = {
+    "parser": "Structured file parser",
+    "rules": "Rule-based text extractor",
+    "llm": "LLM extraction",
+    "rules-fallback": "Rule-based extractor (LLM unavailable)",
+    "llm-fallback": "LLM extraction (parser failed)",
+}
+
+SEVERITY = {
+    "CRITICAL": ("Critical", "rejected", "tri"),
+    "WARNING": ("Warning", "review", "diamond"),
+    "INFO": ("Info", "muted", "dot"),
+}
 
 
 def e(value) -> str:
     return escape("" if value is None else str(value), quote=True)
 
 
-def _short_money(value: float) -> str:
-    if abs(value) >= 1_000_000:
-        return f"${value / 1_000_000:.1f}M"
-    if abs(value) >= 10_000:
-        return f"${value / 1_000:.0f}K"
-    if abs(value) >= 1_000:
-        return f"${value / 1_000:.1f}K"
-    return f"${value:,.0f}"
+def money(value, cents: bool = False) -> str:
+    if value is None:
+        return "n/a"
+    text = f"{abs(value):,.2f}" if cents else f"{abs(value):,.0f}"
+    return f"-${text}" if value < 0 else f"${text}"
 
 
-def _tile_money(value: float) -> str:
-    """Whole dollars: cents add nothing to a headline tile and do not fit a phone."""
-    return f"-${-value:,.0f}" if value < 0 else f"${value:,.0f}"
+def day(value) -> str:
+    if not value:
+        return "—"
+    return f"{value:%b} {value.day}, {value.year}" if isinstance(value, dt.date) else str(value)
 
 
-def _plural(n: int, word: str = "invoice") -> str:
+def _seconds(value: float) -> str:
+    return f"{value * 1000:.0f} ms" if value < 0.1 else f"{value:.1f} s"
+
+
+def plural(n: int, word: str) -> str:
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
-def _badge(outcome: Outcome) -> str:
-    css, icon, label = OUTCOME_META[outcome]
-    return f'<span class="badge {css}"><span class="ico" aria-hidden="true">{icon}</span>{label}</span>'
+def glyph(name: str, tone: str) -> str:
+    return (f'<span class="ap-tone-{tone}" style="display: inline-flex"><span class="ap-glyph '
+            f'ap-glyph--{name}" aria-hidden="true"></span></span>')
 
 
-def _stacked_bar(title: str, parts: list[tuple[str, str, float, str]], total: float, unit: str) -> str:
-    """parts: (css class, label, value, formatted value). A thin stacked bar with a 2px gap
-    between segments, in-segment labels only when they fit, a legend, and a table twin."""
-    segs, legend, rows = [], [], []
-    for css, label, value, shown in parts:
-        share = value / total if total else 0
-        rows.append(f"<tr><th scope='row'>{e(label)}</th><td>{e(shown)}</td><td>{share:.0%}</td></tr>")
-        legend.append(f'<li><span class="swatch {css}"></span>{e(label)} '
-                      f'<b>{e(shown)}</b> <span class="muted">{share:.0%}</span></li>')
-        if value <= 0:
-            continue
-        inside = f'<span class="seglabel">{e(shown)}</span>' if share >= 0.16 else ""
-        segs.append(f'<div class="seg {css}" style="flex:{max(value, total * 0.004)}" tabindex="0" '
-                    f'data-tip="{e(label)}: {e(shown)} ({share:.0%} of {e(unit)})">{inside}</div>')
-    return (f'<figure class="barchart"><figcaption>{e(title)}</figcaption>'
-            f'<div class="bar" role="img" aria-label="{e(title)}">{"".join(segs)}</div>'
-            f'<ul class="legend">{"".join(legend)}</ul>'
-            f'<details class="tableview"><summary>View as table</summary>'
-            f'<table><thead><tr><th>Outcome</th><th>{e(unit.title())}</th><th>Share</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody></table></details></figure>')
+# ---- per-invoice view -----------------------------------------------------------------
 
 
-def _tile(label: str, value: str, note: str = "", css: str = "") -> str:
-    return (f'<div class="tile {css}"><div class="tile-label">{e(label)}</div>'
-            f'<div class="tile-value">{e(value)}</div>'
-            f'<div class="tile-note">{e(note)}</div></div>')
+@dataclass
+class View:
+    key: str
+    r: Result
+    tone: str
+    group: str | None = None
+    owner: str | None = None
+    decider: str | None = None
+    codes: list = field(default_factory=list)
+    phrase: str = ""
+    meta: str = ""
+    status: str = ""
+
+    @property
+    def number(self) -> str:
+        return self.r.invoice.invoice_number or "No number"
+
+    @property
+    def vendor(self) -> str:
+        return self.r.invoice.vendor or "Unknown vendor"
+
+    @property
+    def total(self):
+        return self.r.invoice.total
 
 
-def _reasons(reasons: list[dict]) -> str:
-    if not reasons:
-        return '<p class="muted">No flags.</p>'
-    items = []
-    for r in reasons:
-        sev = r.get("severity", "INFO")
-        fix = ' <span class="muted">(the vendor can correct this)</span>' if r.get("disputable") else ""
-        items.append(f'<li class="reason {e(sev.lower())}"><span class="sev" title="{e(sev)}">'
-                     f'{SEVERITY_ICON.get(sev, "i")}</span><div><code>{e(r["code"])}</code> '
-                     f'{e(r["message"])}{fix}</div></li>')
-    return f'<ul class="reasons">{"".join(items)}</ul>'
+def _group(r: Result, codes: list) -> str:
+    if "DUPLICATE_INVOICE" in codes:
+        return "dup"
+    if FRAUD_SIGNALS & set(codes):
+        return "fraud"
+    if r.vendor_draft is not None:
+        return "fix"
+    return "other"
 
 
-def _path(steps: list[str]) -> str:
-    return f'<ol class="path" aria-label="Decision path">{"".join(f"<li>{e(s)}</li>" for s in steps)}</ol>'
-
-
-def _lines(r: Result) -> str:
-    if not r.invoice.line_items:
-        return ""
-    rows = "".join(
-        f"<tr><td>{e(li.item)}</td><td class='num'>{li.quantity:g}</td>"
-        f"<td class='num'>{money(li.unit_price)}</td><td class='num'>{money(li.amount)}</td>"
-        f"<td class='muted'>{e(li.note)}</td></tr>" for li in r.invoice.line_items)
-    return ('<h4>Line items</h4><table class="lines"><thead><tr><th>Item</th><th class="num">Qty</th>'
-            '<th class="num">Unit price</th><th class="num">Amount</th><th>Note</th></tr></thead>'
-            f'<tbody>{rows}</tbody></table>')
-
-
-def _reasoning(r: Result) -> str:
-    if not r.approval:
-        return ""
-    steps = []
-    for s in r.approval.transcript:
-        text = s.get("rationale") or s.get("reasoning") or ""
-        extra = ""
-        if s["role"] == "critic":
-            extra = " · objected" if s.get("objection") else " · no objection"
-        elif s.get("decision"):
-            extra = f" · {s['decision']}"
-        steps.append(f'<div class="turn {e(s["role"])}"><div class="who">{e(s["role"].title())}'
-                     f' · round {s["round"]}{e(extra)}</div><p>{e(text)}</p></div>')
-    tools = ""
-    if r.approval.tool_calls:
-        rows = "".join(f"<li><code>{e(c['tool'])}({e(json.dumps(c['args'], default=str))})</code></li>"
-                       for c in r.approval.tool_calls)
-        tools = f'<h4>Lookups the approver ran</h4><ul class="tools">{rows}</ul>'
-    return f'<h4>Approver and critic</h4>{"".join(steps)}{tools}'
-
-
-def _draft(label: str, note) -> str:
-    if not note:
-        return ""
-    return (f'<details class="email"><summary>{e(label)}</summary>'
-            f'<pre>To: {e(note.to)}\nSubject: {e(note.subject)}\n\n{e(note.body)}</pre></details>')
-
-
-def _card(r: Result) -> str:
-    css, _, _ = OUTCOME_META[r.outcome]
-    inv = r.invoice
-    top = next((x for x in r.reasons if x["severity"] != "INFO"), None)
-    if r.outcome == Outcome.NEEDS_HUMAN_REVIEW and r.owner:
-        last = f'<span class="owner" title="Suggested owner">{e(r.owner)}</span>'
-        decider = next((c for c in r.owner_why if c.isupper()), None) or (top["code"] if top else None)
-        if decider:
-            last += f' <code>{e(decider)}</code>'
-    elif r.vendor_draft:
-        last = '<span class="muted">vendor can correct</span>'
+def _view(i: int, r: Result) -> View:
+    tone = TONE[r.outcome]
+    reasons = r.reasons
+    codes = [x["code"] for x in reasons]
+    v = View(key=f"i{i}", r=r, tone=tone, codes=codes)
+    if r.outcome == Outcome.NEEDS_HUMAN_REVIEW:
+        v.owner = r.owner or "AP clerk"
+        v.decider = next((c for c in r.owner_why if c.isupper()), None) or (codes[0] if codes else None)
+        v.meta, v.status = v.owner, "Needs review"
+    elif r.outcome == Outcome.REJECTED:
+        v.group = _group(r, codes)
+        critical = [x["code"] for x in reasons if x["severity"] == "CRITICAL"]
+        v.decider = (critical or codes or [None])[0]
+        v.meta = {"fraud": "Do not contact", "fix": "Draft ready", "dup": "No action",
+                  "other": "Not correctable"}[v.group]
+        v.status = f"Rejected: {GROUPS[v.group][0].replace('Blocked: ', '').lower()}"
     else:
-        last = f'<code>{e(top["code"])}</code>' if top else '<span class="muted">clean</span>'
-    search = " ".join(str(x or "") for x in (r.file, inv.invoice_number, inv.vendor, r.outcome.value,
-                                              r.owner, *[x["code"] for x in r.reasons])).lower()
-    warn = '<span class="warnmark" title="Operational warning during this run">⚠</span>' if r.warnings else ""
-    facts = [("Invoice", inv.invoice_number), ("Vendor", inv.vendor), ("Date", inv.date),
-             ("Due", inv.due_date or inv.due_date_text), ("Currency", inv.currency),
-             ("Terms", inv.payment_terms), ("Read by", r.method), ("Time", f"{r.duration_ms:.0f} ms"),
-             ("Model calls", r.llm_calls)]
-    fact_html = "".join(f"<div><dt>{e(k)}</dt><dd>{e(v if v not in (None, '') else '—')}</dd></div>"
-                        for k, v in facts)
-    owner_line = ""
-    if r.outcome == Outcome.NEEDS_HUMAN_REVIEW and r.owner:
-        because = f" because of {', '.join(r.owner_why)}" if r.owner_why else ""
-        owner_line = f'<p class="why"><b>Suggested owner:</b> {e(r.owner)}{e(because)}</p>'
-    payment = (f'<p><b>Payment reference:</b> <code>{e(r.payment.reference)}</code></p>'
-               if r.payment and r.payment.status == "success" else "")
-    warnings = "".join(f'<p class="warnline">⚠ {e(w)}</p>' for w in r.warnings)
+        v.meta, v.status = "Paid", "Ready to pay"
+    if v.decider:
+        message = next((x["message"] for x in reasons if x["code"] == v.decider), "")
+        v.phrase = PHRASES.get(v.decider) or (message[:70] + ("…" if len(message) > 70 else ""))
+    elif r.outcome == Outcome.PAID:
+        v.phrase = "All checks passed"
+    return v
+
+
+# ---- queue rows -----------------------------------------------------------------------
+
+
+def _row(v: View) -> str:
+    search = " ".join(str(x or "") for x in (v.number, v.vendor, v.owner, v.phrase, v.status,
+                                              v.r.file, *v.codes)).lower()
+    prefix = "Suggested owner: " if v.owner else ""
     return (
-        f'<details class="inv {css}" data-search="{e(search)}">'
-        f'<summary><span class="c-badge">{_badge(r.outcome)}{warn}</span>'
-        f'<span class="c-id"><b>{e(inv.invoice_number or "?")}</b><span class="muted">{e(r.file)}</span></span>'
-        f'<span class="c-vendor">{e(inv.vendor or "unknown vendor")}</span>'
-        f'<span class="c-total num">{money(inv.total)}</span>'
-        f'<span class="c-reason">{last}</span></summary>'
-        f'<div class="card-body"><p class="why"><b>Why:</b> {e(r.rationale) or "—"}</p>{owner_line}{warnings}'
-        f'<h4>Decision path</h4>{_path(r.path)}<h4>Reasons</h4>{_reasons(r.reasons)}'
-        f'{_lines(r)}{_reasoning(r)}{payment}<dl class="facts">{fact_html}</dl>'
-        f'{_draft("Notification draft (not sent)", r.notification)}'
-        f'{_draft("Correction request for the vendor: draft for AP review (not sent)", r.vendor_draft)}'
-        f'</div></details>')
+        f'<li class="ap-row-item" data-key="{v.key}" data-owner="{e(v.owner or "")}" '
+        f'data-search="{e(search)}"><button type="button" class="ap-row" aria-current="false" '
+        f'data-key="{v.key}"><span class="ap-row-id">{e(v.number)}</span>'
+        f'<span class="ap-row-vendor" title="{e(v.vendor)}">{e(v.vendor)}</span>'
+        f'<span class="ap-row-amt">{e(money(v.total, True))}</span>'
+        f'<span class="ap-row-reason">{e(v.phrase)}</span>'
+        f'<span class="ap-row-meta"><span class="ap-sr">{prefix}</span>{e(v.meta)}</span>'
+        f'<span class="ap-row-st ap-tone-{v.tone}"><span class="ap-glyph ap-glyph--{GLYPH[v.tone]}" '
+        f'aria-hidden="true"></span>{e(v.status)}</span></button></li>')
 
 
-def _by_owner(held: list[Result]) -> str:
-    totals: dict[str, list] = defaultdict(lambda: [0, 0.0])
-    for r in held:
-        totals[r.owner or "AP clerk"][0] += 1
-        totals[r.owner or "AP clerk"][1] += max(r.invoice.total or 0, 0)
+def _review_section(held: list) -> str:
+    total = sum(max(v.total or 0, 0) for v in held)
+    head = (f'<div class="ap-section-h"><h2 id="ap-rev-h" class="ap-h2">Needs review</h2>'
+            f'<span class="ap-section-n">{len(held)} · {money(total)}</span></div>')
+    if not held:
+        return ('<section class="ap-section" data-queue aria-labelledby="ap-rev-h">' + head +
+                '<p class="ap-empty">Nothing is waiting for a person. Every invoice in this run was '
+                'paid or rejected automatically.</p></section>')
+    owners = [o for o in reversed(ROLES) if any(v.owner == o for v in held)]
+    chips = ['<button type="button" class="ap-chip" aria-pressed="true" data-owner="all">'
+             f'<span>All</span><span class="ap-chip-n">{len(held)}</span>'
+             f'<span class="ap-chip-amt">{money(total)}</span></button>']
+    for o in owners:
+        mine = [v for v in held if v.owner == o]
+        chips.append(
+            f'<button type="button" class="ap-chip" aria-pressed="false" data-owner="{e(o)}">'
+            f'<span>{e(o)}</span><span class="ap-chip-n">{len(mine)}</span>'
+            f'<span class="ap-chip-amt">{money(sum(max(v.total or 0, 0) for v in mine))}</span></button>')
+    return ('<section class="ap-section" data-queue aria-labelledby="ap-rev-h">' + head +
+            '<div class="ap-chips" role="group" aria-label="Filter by suggested owner">'
+            + "".join(chips) + '</div>'
+            '<ul class="ap-rows" id="ap-review-rows" data-ctx="Needs review">'
+            + "".join(_row(v) for v in held) + '</ul>'
+            '<div class="ap-more" data-more hidden><button type="button" class="ap-btn">Show more'
+            '</button></div></section>')
+
+
+def _group_block(dom: str, label: str, note: str, glyph_name: str, tone: str, count: int,
+                 amount: float, rows: list, top: bool = False) -> str:
+    tag = "h2" if top else "h3"
+    cls = "ap-group-btn ap-group-btn--top" if top else "ap-group-btn"
+    heading = (f'<{tag} class="ap-h3" style="color: inherit; font-size: inherit; font-weight: inherit">'
+               if not top else f'<{tag} class="ap-h2">')
+    return (f'<div class="ap-group">{heading}<button type="button" class="{cls}" aria-expanded="false" '
+            f'aria-controls="{dom}"><span class="ap-caret" aria-hidden="true"></span>'
+            f'<span class="ap-group-glyph ap-tone-{tone}"><span class="ap-glyph ap-glyph--{glyph_name}" '
+            f'aria-hidden="true"></span></span><span class="ap-group-label">{e(label)}</span>'
+            f'<span class="ap-group-meta">{count} · {money(amount)}</span>'
+            f'<span class="ap-group-note">{e(note)}</span></button></{tag}>'
+            f'<ul id="{dom}" class="ap-rows is-collapsed" data-ctx="{e(label)}">'
+            + "".join(_row(v) for v in rows) + '</ul></div>')
+
+
+def _rejected_section(rejected: list) -> str:
+    if not rejected:
+        return ""
+    amount = sum(max(v.total or 0, 0) for v in rejected)
+    blocks = []
+    for key in GROUP_ORDER:
+        rows = [v for v in rejected if v.group == key]
+        if rows:
+            label, note, g = GROUPS[key]
+            blocks.append(_group_block(f"ap-grp-{key}", label, note, g, "rejected", len(rows),
+                                       sum(max(v.total or 0, 0) for v in rows), rows))
+    return ('<section class="ap-section" data-queue aria-labelledby="ap-rej-h"><div class="ap-section-h">'
+            f'<h2 id="ap-rej-h" class="ap-h2">Rejected</h2><span class="ap-section-n">{len(rejected)} '
+            f'· {money(amount)} not paid</span></div>' + "".join(blocks) + '</section>')
+
+
+def _paid_section(paid: list) -> str:
+    if not paid:
+        return ""
+    return ('<section class="ap-section" data-queue aria-label="Ready to pay">'
+            + _group_block("ap-paid-rows", "Ready to pay",
+                           "Approved automatically. No action needed.", "check", "paid", len(paid),
+                           sum(max(v.total or 0, 0) for v in paid), paid, top=True)
+            + '</section>')
+
+
+# ---- detail panel ---------------------------------------------------------------------
+
+
+def _steps(r: Result) -> list:
+    """(label, state, text) for the five stages. state: ok | held | block | skip."""
+    path = r.path
+    failed = "ingest:failed" in path
+    steps = [("Ingest", "block" if failed else "ok",
+              "Could not read" if failed else METHOD_TEXT.get(r.method, r.method).lower())]
+    validate = next((p for p in path if p.startswith("validate:")), None)
+    if failed or validate is None:
+        steps.append(("Validate", "skip", ""))
+    else:
+        hard = int(validate.split(":")[1].split(" ")[0])
+        steps.append(("Validate", "block" if hard else "ok", plural(hard, "hard fail") if hard else "passed"))
+    floor = next((p for p in path if p.startswith("floor:")), None)
+    if floor is None:
+        steps.append(("Policy floor", "skip", ""))
+    elif floor.endswith("ESCALATE"):
+        steps.append(("Policy floor", "held", "Escalated"))
+    elif floor.endswith("REJECT"):
+        steps.append(("Policy floor", "block", "Rejected"))
+    else:
+        steps.append(("Policy floor", "ok", "passed"))
+    approver = next((p for p in path if p.startswith("approver:")), None)
+    if approver:
+        decision = approver.split(":")[1].split(" ")[0]
+        state, text = {"APPROVE": ("ok", "Approved"), "ESCALATE": ("held", "Held"),
+                       "REJECT": ("block", "Rejected")}.get(decision, ("ok", decision))
+        steps.append(("Approver", state, text))
+    elif "auto-approve" in path:
+        steps.append(("Auto-approve", "ok", "no flags"))
+    else:
+        steps.append(("Approver", "skip", ""))
+    if "pay" in path:
+        steps.append(("Pay", "ok", "Paid"))
+    elif "pay:failed" in path:
+        steps.append(("Pay", "block", "Failed"))
+    else:
+        steps.append(("Pay", "skip", ""))
+    return steps
+
+
+STEP_GLYPH = {"ok": ("check", "paid"), "held": ("ring", "review"), "block": ("x", "rejected"),
+              "skip": ("dash", "faint")}
+
+
+def _path_html(r: Result) -> str:
+    items = []
+    for label, state, text in _steps(r):
+        g, tone = STEP_GLYPH[state]
+        text_html = f'<span class="ap-step-state">{e(text)}</span>' if text else ""
+        items.append(f'<li class="ap-step ap-step--{state}">{glyph(g, tone)}'
+                     f'<span class="ap-step-label">{e(label)}</span>{text_html}</li>')
+    return f'<ol class="ap-path">{"".join(items)}</ol>'
+
+
+def _kv(v: View) -> list:
+    inv = v.r.invoice
+    due = day(inv.due_date) if inv.due_date else (inv.due_date_text or "—")
+    if v.r.outcome == Outcome.NEEDS_HUMAN_REVIEW:
+        kv = [("Suggested owner", v.owner, ""), ("Decided by", v.decider or "—", "ap-mono")]
+        others = [c for c in v.codes if c != v.decider]
+        if others:
+            kv.append(("Also flagged", ", ".join(others), "ap-mono"))
+        return kv + [("Due", due, "")]
+    if v.r.outcome == Outcome.PAID:
+        ref = v.r.payment.reference if v.r.payment else None
+        return [("Payment", ref or "—", ""), ("Due", due, "")]
+    can = {"fix": "Yes, request drafted", "fraud": "No. Do not contact",
+           "dup": "No action: already processed", "other": "No: not correctable as billed"}[v.group]
+    kv = [("Vendor can correct", can, ""), ("Decided by", v.decider or "—", "ap-mono")]
+    others = [c for c in v.codes if c != v.decider]
+    if others:
+        signals = [c for c in v.codes if c in FRAUD_SIGNALS]
+        if v.group == "fraud" and signals:
+            kv.append(("Fraud flags", str(len(signals)), ""))
+        else:
+            kv.append(("Also flagged", ", ".join(others), "ap-mono"))
+    return kv
+
+
+def _reasons_html(reasons: list) -> str:
+    order = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+    items = []
+    for x in sorted(reasons, key=lambda x: order.get(x["severity"], 3)):
+        label, tone, g = SEVERITY.get(x["severity"], SEVERITY["INFO"])
+        fix = " (the vendor can correct this)" if x.get("disputable") else ""
+        items.append(f'<li><span class="ap-sev ap-tone-{tone}"><span class="ap-glyph ap-glyph--{g}" '
+                     f'aria-hidden="true"></span>{label}</span><code class="ap-code">{e(x["code"])}</code>'
+                     f'<span class="ap-reason-msg">{e(x["message"])}{e(fix)}</span></li>')
+    return f'<ul class="ap-reasons">{"".join(items)}</ul>' if items else \
+        '<p class="ap-muted">No flags.</p>'
+
+
+def _lines_html(v: View) -> str:
+    inv = v.r.invoice
     rows = "".join(
-        f"<tr><th scope='row'>{e(role)}</th><td class='num'>{totals[role][0]}</td>"
-        f"<td class='num'>{money(totals[role][1])}</td></tr>"
-        for role in reversed(ROLES) if role in totals)
-    return ('<table class="owners"><thead><tr><th>Suggested owner</th><th class="num">Invoices</th>'
-            f'<th class="num">Held</th></tr></thead><tbody>{rows}</tbody></table>')
+        f'<div role="row"><span role="cell">{e(li.item)}</span><span role="cell" class="num">{li.quantity:g}'
+        f'</span><span role="cell" class="num">{e(money(li.unit_price, True))}</span>'
+        f'<span role="cell" class="num">{e(money(li.amount, True))}</span>'
+        f'<span role="cell" class="ap-note">{e(li.note)}</span></div>' for li in inv.line_items)
+    if not rows:
+        return '<p class="ap-muted">No line items were found.</p>'
+    return (f'<div class="ap-tablebox"><div class="ap-gt ap-gt--lines" role="table" '
+            f'aria-label="Line items for {e(v.number)}"><div role="row"><span role="columnheader">Item</span>'
+            '<span role="columnheader" class="num">Qty</span><span role="columnheader" class="num">Unit price'
+            '</span><span role="columnheader" class="num">Amount</span><span role="columnheader">Note</span>'
+            f'</div>{rows}<div role="row"><span role="rowheader" class="is-total">Invoice total</span>'
+            '<span role="cell" class="is-total"></span><span role="cell" class="is-total"></span>'
+            f'<span role="cell" class="num is-total">{e(money(inv.total, True))}</span>'
+            '<span role="cell" class="is-total"></span></div></div></div>')
 
 
-def _queue(css: str, title: str, blurb: str, results: list[Result], extra: str = "") -> str:
-    if not results:
-        return (f'<section class="queue {css}"><h2>{e(title)} <span class="count">0</span></h2>'
-                f'<p class="muted">Nothing here.</p></section>')
-    return (f'<section class="queue {css}"><h2>{e(title)} <span class="count">{len(results)}</span></h2>'
-            f'<p class="muted">{e(blurb)}</p>{extra}{"".join(_card(r) for r in results)}</section>')
+def _facts(v: View) -> list:
+    r, inv = v.r, v.r.invoice
+    ms = r.duration_ms
+    if r.payment and r.payment.status == "success":
+        payment = r.payment.reference
+    else:
+        payment = "None (not paid)"
+    return [("Invoice date", day(inv.date)), ("Due date", day(inv.due_date) if inv.due_date
+                                               else (inv.due_date_text or "—")),
+            ("Terms", inv.payment_terms or "—"), ("Currency", inv.currency),
+            ("Read by", METHOD_TEXT.get(r.method, r.method or "—")),
+            ("Processing time", f"{ms:.0f} ms" if ms < 1000 else f"{ms / 1000:.1f} s"),
+            ("Model calls", str(r.llm_calls)), ("Payment reference", payment)]
 
 
-CSS = """
-:root{--page:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;
---grid:#e1e0d9;--axis:#c3c2b7;--ring:rgba(11,11,11,.10);--wash:rgba(11,11,11,.04);
---good:#0ca30c;--warn:#fab219;--crit:#d03b3b;--fill-ink:#fff;--warn-ink:#0b0b0b;--accent:#2a78d6;
-color-scheme:light}
-@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){--page:#0d0d0d;
---surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;
---ring:rgba(255,255,255,.10);--wash:rgba(255,255,255,.05);--accent:#3987e5;color-scheme:dark}}
-:root[data-theme="dark"]{--page:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;
---grid:#2c2c2a;--axis:#383835;--ring:rgba(255,255,255,.10);--wash:rgba(255,255,255,.05);
---accent:#3987e5;color-scheme:dark}
-*{box-sizing:border-box}
-body{margin:0;background:var(--page);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1080px;margin:0 auto;padding:24px 16px 64px}
-header.top{display:flex;gap:16px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
-h1{font-size:22px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 6px}h4{font-size:12px;margin:18px 0 6px;color:var(--ink2);text-transform:uppercase;letter-spacing:.04em}
-.sub,.muted{color:var(--ink2)}.muted{font-size:13px}.num{text-align:right}
-button{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:8px;padding:6px 12px;cursor:pointer;min-height:36px}
-button:hover{background:var(--wash)}
-button:focus-visible,summary:focus-visible,input:focus-visible,.seg:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.notice{margin:16px 0 0;padding:10px 14px;border:1px solid var(--axis);border-left:4px solid var(--warn);border-radius:8px;background:var(--surface);font-size:14px}
-.hero{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-end;margin:24px 0 8px}
-.hero-fig{font-size:56px;line-height:1;font-weight:650;letter-spacing:-.02em}
-.hero-cap{max-width:38ch;color:var(--ink2)}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:16px 0}
-.tile{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:14px 16px}
-.tile{min-width:0}.tile-label{font-size:13px;color:var(--ink2)}.tile-value{font-size:clamp(18px,5.4vw,28px);font-weight:600;margin-top:2px;white-space:nowrap}
-.tile-note{font-size:12px;color:var(--muted);min-height:1.2em}
-.tile.paid{border-top:3px solid var(--good)}.tile.review{border-top:3px solid var(--warn)}.tile.rejected{border-top:3px solid var(--crit)}
-.panel{background:var(--surface);border:1px solid var(--ring);border-radius:12px;padding:16px 18px}
-.barchart{margin:0 0 20px}.barchart figcaption{font-size:13px;color:var(--ink2);margin-bottom:8px}
-.bar{display:flex;gap:2px;height:30px}
-.seg{border-radius:4px;display:flex;align-items:center;justify-content:center;min-width:6px;overflow:hidden}
-.seglabel{font-size:12px;font-weight:600;padding:0 6px;white-space:nowrap;color:var(--fill-ink)}
-.seg.review .seglabel{color:var(--warn-ink)}
-.seg.paid,.swatch.paid{background:var(--good)}.seg.review,.swatch.review{background:var(--warn)}.seg.rejected,.swatch.rejected{background:var(--crit)}
-.legend{list-style:none;padding:0;margin:8px 0 0;display:flex;flex-wrap:wrap;gap:6px 18px;font-size:13px}
-.swatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px}
-.tableview{margin-top:6px;font-size:13px}.tableview summary{cursor:pointer;color:var(--ink2)}
-table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:6px 8px;border-bottom:1px solid var(--grid);text-align:left;vertical-align:top}
-th.num{text-align:right}td.num{text-align:right}
-.owners{max-width:420px;margin:8px 0 14px}
-.tip{position:fixed;z-index:10;pointer-events:none;background:var(--ink);color:var(--surface);padding:6px 10px;border-radius:6px;font-size:12px;max-width:260px;display:none}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:2px 10px 2px 4px;border-radius:999px;background:var(--wash);border:1px solid var(--ring);white-space:nowrap}
-.badge .ico{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;font-size:11px;color:var(--fill-ink)}
-.badge.paid .ico{background:var(--good)}.badge.review .ico{background:var(--warn);color:var(--warn-ink)}.badge.rejected .ico{background:var(--crit)}
-.count{font-size:13px;background:var(--wash);border:1px solid var(--ring);border-radius:999px;padding:0 8px;margin-left:6px;font-weight:600}
-.owner{font-size:12px;font-weight:600;background:var(--wash);border:1px solid var(--ring);border-radius:6px;padding:1px 8px}
-.searchrow{display:flex;gap:12px;align-items:center;margin:28px 0 0;flex-wrap:wrap}
-.searchrow input{flex:1;min-width:200px;font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--axis);border-radius:8px;padding:6px 10px;min-height:36px}
-.queue.review h2{border-left:4px solid var(--warn);padding-left:10px}.queue.paid h2{border-left:4px solid var(--good);padding-left:10px}.queue.rejected h2{border-left:4px solid var(--crit);padding-left:10px}
-details.inv{background:var(--surface);border:1px solid var(--ring);border-radius:10px;margin-bottom:8px}
-details.inv>summary{list-style:none;display:grid;grid-template-columns:130px 1.1fr 1.4fr 110px 1.3fr;gap:12px;align-items:center;padding:10px 14px;cursor:pointer;min-height:48px}
-details.inv>summary::-webkit-details-marker{display:none}
-details.inv>summary:hover{background:var(--wash)}
-.c-reason{display:flex;flex-wrap:wrap;gap:4px 6px;align-items:center}
-.c-id{display:flex;flex-direction:column;overflow:hidden;text-overflow:ellipsis}.c-id .muted{font-size:12px}
-.card-body{padding:4px 18px 18px;border-top:1px solid var(--grid)}
-.why{margin:12px 0 0}.warnline{color:var(--ink2);font-size:13px;margin:6px 0 0}.warnmark{margin-left:6px}
-.path{display:flex;flex-wrap:wrap;gap:6px;list-style:none;padding:0;margin:0}
-.path li{font-size:12px;background:var(--wash);border:1px solid var(--ring);border-radius:6px;padding:2px 8px}
-.path li:not(:last-child)::after{content:"→";margin-left:8px;color:var(--muted)}
-.reasons{list-style:none;padding:0;margin:0;display:grid;gap:6px}
-.reason{display:flex;gap:10px;align-items:flex-start;font-size:13px}
-.sev{flex:none;width:18px;height:18px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--fill-ink);background:var(--muted)}
-.reason.critical .sev{background:var(--crit)}.reason.warning .sev{background:var(--warn);color:var(--warn-ink)}
-code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--wash);border-radius:4px;padding:1px 5px}
-.turn{border-left:3px solid var(--axis);padding:2px 12px;margin:8px 0}.turn .who{font-size:12px;color:var(--ink2);font-weight:600}.turn p{margin:2px 0;font-size:13px}
-.tools{margin:0;padding-left:18px;font-size:13px}
-.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px 16px;margin:16px 0 0}
-.facts dt{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}.facts dd{margin:0;font-size:13px}
-.email{margin-top:12px;font-size:13px}.email summary{cursor:pointer;color:var(--ink2)}
-pre{white-space:pre-wrap;background:var(--wash);border-radius:8px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-.about p{margin:6px 0}
-@media (max-width:720px){details.inv>summary{grid-template-columns:1fr auto;gap:4px 12px}.c-vendor,.c-reason{grid-column:1/-1}.hero-fig{font-size:44px}}
-@media print{.searchrow,button{display:none}details.inv{break-inside:avoid}}
-"""
-
-JS = """
-(function(){
-  var root=document.documentElement;
-  try{var t=localStorage.getItem('theme');if(t)root.setAttribute('data-theme',t);}catch(e){}
-  var tb=document.getElementById('theme');
-  if(tb)tb.addEventListener('click',function(){
-    var dark=root.getAttribute('data-theme')==='dark'||(!root.getAttribute('data-theme')&&matchMedia('(prefers-color-scheme: dark)').matches);
-    var next=dark?'light':'dark';root.setAttribute('data-theme',next);
-    try{localStorage.setItem('theme',next);}catch(e){}
-  });
-  var cards=[].slice.call(document.querySelectorAll('details.inv'));
-  var q=document.getElementById('search'),shown=document.getElementById('shown');
-  function apply(){
-    var text=(q.value||'').toLowerCase().trim(),n=0;
-    cards.forEach(function(c){var ok=!text||c.dataset.search.indexOf(text)>-1;c.style.display=ok?'':'none';if(ok)n++;});
-    if(shown)shown.textContent=text?n+' of '+cards.length+' match':'';
-  }
-  if(q)q.addEventListener('input',apply);
-  var tip=document.getElementById('tip');
-  document.querySelectorAll('.seg').forEach(function(s){
-    function show(ev){var r=s.getBoundingClientRect();tip.textContent=s.dataset.tip;tip.style.display='block';
-      var x=ev&&ev.clientX?ev.clientX:r.left+r.width/2,y=r.top;
-      tip.style.left=Math.max(8,Math.min(x-tip.offsetWidth/2,innerWidth-tip.offsetWidth-8))+'px';
-      tip.style.top=(y-tip.offsetHeight-8)+'px';}
-    function hide(){tip.style.display='none';}
-    s.addEventListener('mousemove',show);s.addEventListener('focus',function(){show();});
-    s.addEventListener('mouseleave',hide);s.addEventListener('blur',hide);
-  });
-})();
-"""
+def _draft(note) -> str:
+    return f"To: {note.to}\nSubject: {note.subject}\n\n{note.body}"
 
 
-def build_report(results: list[Result], run_id: str, provider_name: str, is_mock: bool,
-                 as_of: dt.date, generated: dt.datetime | None = None) -> str:
-    s = summarize(results, provider_name)
+def _disclosures(v: View) -> str:
+    r = v.r
+    turns = r.approval.transcript if r.approval else []
+    tools = r.approval.tool_calls if r.approval else []
+    if turns:
+        items = []
+        for t in turns:
+            extra = ""
+            if t["role"] == "critic":
+                extra = " · objected" if t.get("objection") else " · no objection"
+            elif t.get("decision"):
+                extra = f" · {t['decision']}"
+            text = t.get("rationale") or t.get("reasoning") or ""
+            items.append(f'<li><p class="ap-turn-role">{e(t["role"].title())} · round {t["round"]}'
+                         f'{e(extra)}</p><p class="ap-turn-text">{e(text)}</p></li>')
+        turns_html = f'<ol class="ap-turns">{"".join(items)}</ol>'
+    else:
+        turns_html = ('<p class="ap-muted">No model reasoning: deterministic checks decided this '
+                      'invoice.</p>')
+    if tools:
+        rows = "".join(
+            f'<div><dt>{e(c["tool"])}({e(json.dumps(c["args"], default=str))})</dt>'
+            f'<dd>{e(_short(json.dumps(c["result"], default=str)))}</dd></div>' for c in tools)
+        lookups_html = f'<dl class="ap-lookups">{rows}</dl>'
+    else:
+        lookups_html = '<p class="ap-muted">The approver was not asked, so no lookups ran.</p>'
+    if r.warnings:
+        warns = "".join(f'<li>{glyph("dot", "muted")}<span>{e(w)}</span></li>' for w in r.warnings)
+        warn_html = f'<ul class="ap-warns">{warns}</ul>'
+    else:
+        warn_html = '<p class="ap-muted">None. The run handled this invoice without operational issues.</p>'
+    parts = [
+        f'<details class="ap-disc"><summary>Approver and critic reasoning '
+        f'<span class="ap-disc-n">{len(turns)}</span></summary><div class="ap-disc-body">{turns_html}</div></details>',
+        f'<details class="ap-disc"><summary>Lookups the approver ran <span class="ap-disc-n">{len(tools)}'
+        f'</span></summary><div class="ap-disc-body">{lookups_html}</div></details>',
+        f'<details class="ap-disc"><summary>Operational warnings <span class="ap-disc-n">{len(r.warnings)}'
+        f'</span></summary><div class="ap-disc-body">{warn_html}</div></details>',
+    ]
+    if r.notification:
+        parts.append(f'<details class="ap-disc"><summary>Draft: notify {e(r.notification.to)}</summary>'
+                     f'<div class="ap-disc-body"><pre class="ap-draft">{e(_draft(r.notification))}</pre></div></details>')
+    if r.vendor_draft:
+        parts.append('<details class="ap-disc"><summary>Draft: correction request to vendor</summary>'
+                     f'<div class="ap-disc-body"><pre class="ap-draft">{e(_draft(r.vendor_draft))}</pre></div></details>')
+    else:
+        note = {"fraud": "No vendor draft: this sender should not be contacted until a person decides.",
+                "dup": "No vendor draft: the original invoice was already processed.",
+                "other": "No vendor draft: nothing the vendor can correct as billed."}.get(
+            v.group or "", "No vendor draft: this invoice was not rejected.")
+        parts.append(f'<p class="ap-disc-note">{e(note)}</p>')
+    return f'<div class="ap-discs">{"".join(parts)}</div>'
+
+
+def _short(text: str, limit: int = 160) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _detail(v: View) -> str:
+    r, inv = v.r, v.r.invoice
+    status_label = v.status
+    g = GLYPH[v.tone]
+    kv = "".join(f'<div><dt>{e(k)}</dt><dd class="{c}">{e(val)}</dd></div>' for k, val, c in _kv(v))
+    facts = "".join(f"<div><dt>{e(k)}</dt><dd>{e(val)}</dd></div>" for k, val in _facts(v))
+    currency = f'<span class="ap-dcur">{e(inv.currency)}, not converted</span>' if inv.currency != "USD" else ""
+    return (
+        '<div class="ap-d"><div class="ap-dbar">'
+        '<button type="button" class="ap-btn ap-back" data-close><svg width="14" height="14" viewBox="0 0 16 16" '
+        'fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M10 3L5 8l5 5"></path>'
+        '</svg><span>Back to list</span></button>'
+        f'<span class="ap-dstatus ap-tone-{v.tone}"><span class="ap-glyph ap-glyph--{g}" aria-hidden="true">'
+        f'</span>{e(status_label)}</span><div class="ap-dnav"><span class="ap-dpos" data-pos></span>'
+        '<button type="button" class="ap-btn ap-iconbtn" aria-label="Previous invoice" data-prev>'
+        '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" '
+        'aria-hidden="true"><path d="M3 10l5-5 5 5"></path></svg></button>'
+        '<button type="button" class="ap-btn ap-iconbtn" aria-label="Next invoice" data-next>'
+        '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" '
+        'aria-hidden="true"><path d="M3 6l5 5 5-5"></path></svg></button>'
+        '<button type="button" class="ap-btn ap-iconbtn ap-close" aria-label="Close detail" data-close>'
+        '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" '
+        'aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"></path></svg></button></div></div>'
+        f'<div class="ap-dhead"><p class="ap-did"><span class="ap-mono">{e(v.number)}</span>'
+        f'<span aria-hidden="true">·</span><span class="ap-dfile">{e(r.file)}</span></p>'
+        f'<h2 class="ap-dvendor" tabindex="-1">{e(v.vendor)}</h2>'
+        f'<p class="ap-damt">{e(money(inv.total, True))} {currency}</p><dl class="ap-dkv">{kv}</dl></div>'
+        f'<div class="ap-dsec"><h3 class="ap-h3">Why</h3><p class="ap-why">{e(r.rationale) or "—"}</p></div>'
+        f'<div class="ap-dsec"><h3 class="ap-h3">Decision path</h3>{_path_html(r)}</div>'
+        f'<div class="ap-dsec"><h3 class="ap-h3">Reasons <span class="ap-h3-n">{len(r.reasons)}</span></h3>'
+        f'{_reasons_html(r.reasons)}</div>'
+        f'<div class="ap-dsec"><h3 class="ap-h3">Line items</h3>{_lines_html(v)}</div>'
+        f'<div class="ap-dsec"><h3 class="ap-h3">Facts</h3><dl class="ap-facts">{facts}</dl></div>'
+        f'{_disclosures(v)}</div>')
+
+
+# ---- summary --------------------------------------------------------------------------
+
+
+def _mix(segments: list, mode: str, n: int, total: float) -> str:
+    """One bar plus legend for 'dollars' or 'count'."""
+    def pct(value, whole):
+        if not whole:
+            return "0%"
+        p = value / whole * 100
+        return "<1%" if 0 < p < 1 else f"{round(p)}%"
+
+    bars, legend, aria = [], [], []
+    for label, tone, g, items in segments:
+        amount = sum(max(v.total or 0, 0) for v in items)
+        count = len(items)
+        count_text = plural(count, "invoice")
+        grow = max(amount, 0.0001) if mode == "dollars" else count
+        primary = money(amount) if mode == "dollars" else count_text
+        secondary = (f"{count_text} · {pct(amount, total)}" if mode == "dollars"
+                     else f"{money(amount)} · {pct(count, n)}")
+        bars.append(f'<span class="ap-mix-seg ap-tone-{tone}" style="flex-grow: {grow}"></span>')
+        legend.append(f'<li><span class="ap-legend-label">{glyph(g, tone)}{e(label)}</span>'
+                      f'<span class="ap-legend-val">{e(primary)}</span>'
+                      f'<span class="ap-legend-sub">{e(secondary)}</span></li>')
+        aria.append(f"{label} {primary}")
+    hidden = "" if mode == "dollars" else " hidden"
+    return (f'<div data-mode="{mode}"{hidden}><div class="ap-mix" role="img" aria-label="Outcome by {mode}: '
+            f'{e("; ".join(aria))}">{"".join(bars)}</div><ul class="ap-legend">{"".join(legend)}</ul></div>')
+
+
+def _summary(views: list, results: list, held: list, paid: list, rejected: list) -> str:
+    n = len(views)
+    total = sum(max(v.total or 0, 0) for v in views)
+    segments = [s for s in (("Needs review", "review", "ring", held), ("Ready to pay", "paid", "check", paid),
+                            ("Rejected, not paid", "rejected", "x", rejected)) if s[3]]
+    auto = n - len(held)
+    if n == 1:
+        headline = ("The one invoice in this run was resolved without a person." if auto
+                    else "The one invoice in this run needs a person.")
+    else:
+        headline = f"{round(auto / n * 100) if n else 0}% of {n} invoices were resolved without a person."
+    fraud = [v for v in rejected if v.group == "fraud"]
+    dups = [v for v in rejected if v.group == "dup"]
+    if held:
+        unit = "invoice to review" if len(held) == 1 else "invoices to review"
+        focus = (f'<p class="ap-eyebrow">{glyph("ring", "review")}Needs review</p>'
+                 f'<p class="ap-display">{len(held)} <span class="ap-display-unit">{unit}</span></p>'
+                 f'<p class="ap-held">{money(sum(max(v.total or 0, 0) for v in held))} held for a person</p>')
+    else:
+        focus = (f'<p class="ap-eyebrow">{glyph("check", "paid")}Needs review</p>'
+                 '<p class="ap-display">Nothing to review</p>')
+    if fraud:
+        who = plural(len(fraud), "invoice")
+        alert = ('<div class="ap-alert" role="note">' + glyph("tri", "rejected") +
+                 f'<p><strong>Possible fraud.</strong> {who} blocked, '
+                 f'{money(sum(max(v.total or 0, 0) for v in fraud))}. Do not contact these senders.</p>'
+                 '<button type="button" class="ap-btn" data-fraud-btn>Show</button></div>')
+    else:
+        alert = f'<p class="ap-calm">{glyph("check", "muted")}No fraud flags in this run.</p>'
+    twin = "".join(
+        f'<div role="row"><span role="rowheader">{e(label)}</span><span role="cell" class="num">{len(items)}'
+        f'</span><span role="cell" class="num">{e(money(sum(max(v.total or 0, 0) for v in items)))}</span>'
+        f'<span role="cell" class="num">'
+        f'{round(sum(max(v.total or 0, 0) for v in items) / total * 100) if total else 0}%</span></div>'
+        for label, _, _, items in segments)
+    calls = sum(r.llm_calls for r in results)
+    per = calls / n if n else 0
+    avg = sum(r.duration_ms for r in results) / n / 1000 if n else 0
+    dup_text = f"{len(dups)} · {money(sum(max(v.total or 0, 0) for v in dups))}" if dups else "None"
+    return (
+        '<section class="ap-summary" aria-labelledby="ap-sum-h"><h2 id="ap-sum-h" class="ap-sr">Run summary</h2>'
+        f'<div class="ap-focus">{focus}<p class="ap-lede">{e(headline)}</p>{alert}</div>'
+        '<div class="ap-mixwrap"><div class="ap-mixhead"><h3 class="ap-h3">Outcome by '
+        '<span data-mode-word>dollars</span></h3><div class="ap-seg" role="group" aria-label="Measure outcomes by">'
+        '<button type="button" aria-pressed="true" data-mode-btn="dollars">Dollars</button>'
+        '<button type="button" aria-pressed="false" data-mode-btn="count">Count</button></div></div>'
+        f'{_mix(segments, "dollars", n, total)}{_mix(segments, "count", n, total)}'
+        '<details class="ap-twin"><summary>View as table</summary><div class="ap-gt ap-gt--mix" role="table" '
+        'aria-label="Outcomes by dollars and count"><div role="row"><span role="columnheader">Outcome</span>'
+        '<span role="columnheader" class="num">Invoices</span><span role="columnheader" class="num">Dollars</span>'
+        f'<span role="columnheader" class="num">Share of $</span></div>{twin}<div role="row">'
+        f'<span role="rowheader" class="is-total">Total</span><span role="cell" class="num is-total">{n}</span>'
+        f'<span role="cell" class="num is-total">{e(money(total))}</span><span role="cell" class="num is-total">'
+        '100%</span></div></div></details></div>'
+        '<dl class="ap-stats">'
+        f'<div><dt>Duplicate copies caught</dt><dd>{e(dup_text)}</dd></div>'
+        f'<div><dt>Model calls</dt><dd>{calls} · {per:.1f} per invoice</dd></div>'
+        f'<div><dt>Average time per invoice</dt><dd>{_seconds(avg)}</dd></div></dl></section>')
+
+
+def _about(results: list, provider_name: str) -> str:
+    n = len(results)
+    usage = [u for r in results for u in r.usage]
+    roles = Counter(u.role for u in usage)
+    breakdown = ", ".join(f"{role} {count}" for role, count in sorted(roles.items()))
+    tokens_in = sum(u.input_tokens for u in usage)
+    tokens_out = sum(u.output_tokens for u in usage)
+    text = f"{len(usage)} calls · {len(usage) / n:.1f} per invoice" if n else "0 calls"
+    if breakdown:
+        text += f" · {breakdown}"
+    if tokens_in or tokens_out:
+        text += f" · {tokens_in:,} tokens in, {tokens_out:,} out"
+    from .llm import estimated_cost
+
+    cost = estimated_cost(usage)
+    if cost is not None and n:
+        text += f" · about ${cost:.4f} (${cost / n:.4f} per invoice)"
+    return (
+        '<footer class="ap-about" aria-labelledby="ap-about-h"><h2 id="ap-about-h" class="ap-h2">About this run</h2>'
+        f'<dl class="ap-about-dl"><div><dt>Model usage</dt><dd>{e(text)}</dd></div>'
+        f'<div><dt>Provider</dt><dd>{e(provider_name)}</dd></div>'
+        f'<div><dt>Invoices processed</dt><dd>{n}</dd></div></dl>'
+        '<ul class="ap-caveats"><li>If this is the provided sample set, about half the invoices are deliberately '
+        'bad, so these figures show the controls working.</li><li>They are not a savings estimate.</li></ul>'
+        '</footer>')
+
+
+# ---- the page -------------------------------------------------------------------------
+
+
+def build_report(results: list, run_id: str, provider_name: str, is_mock: bool, as_of: dt.date,
+                 generated: dt.datetime | None = None) -> str:
     generated = generated or dt.datetime.now()
-    n = s["invoices"]
-    by_outcome = {o: [r for r in results if r.outcome == o] for o in Outcome}
-    held, paid, rejected = (by_outcome[Outcome.NEEDS_HUMAN_REVIEW], by_outcome[Outcome.PAID],
-                            by_outcome[Outcome.REJECTED])
-    dupes = [r for r in results if any(x["code"] == "DUPLICATE_INVOICE" for x in r.reasons)]
-    dupe_total = sum(max(r.invoice.total or 0, 0) for r in dupes)
-    drafts = sum(1 for r in rejected if r.vendor_draft)
+    views = [_view(i, r) for i, r in enumerate(results)]
+    views.sort(key=lambda v: (v.r.invoice.invoice_number or "￿", v.r.file))
+    held = [v for v in views if v.r.outcome == Outcome.NEEDS_HUMAN_REVIEW]
+    held.sort(key=lambda v: (-ROLES.index(v.owner or "AP clerk"), v.number))  # most senior first
+    rejected = [v for v in views if v.r.outcome == Outcome.REJECTED]
+    paid = [v for v in views if v.r.outcome == Outcome.PAID]
 
-    money_parts = [
-        ("paid", "Paid", s["paid_total"], _short_money(s["paid_total"])),
-        ("review", "Held for review", s["review_total"], _short_money(s["review_total"])),
-        ("rejected", "Rejected, not paid", s["rejected_total"], _short_money(s["rejected_total"])),
-    ]
-    count_parts = [
-        ("paid", "Paid", s["paid"], str(s["paid"])),
-        ("review", "Needs review", s["needs_review"], str(s["needs_review"])),
-        ("rejected", "Rejected", s["rejected"], str(s["rejected"])),
-    ]
-    cost = ""
-    if s["estimated_llm_cost"] is not None:
-        cost = (f" Estimated model cost: ${s['estimated_llm_cost']:.4f} "
-                f"(${s['cost_per_invoice']:.4f} per invoice).")
-    tokens = (f"{s['llm_calls']} model calls ({s['llm_calls_per_invoice']} per invoice), "
-              f"{s['input_tokens']:,} input and {s['output_tokens']:,} output tokens.{cost}")
-    mock_notice = ""
-    if is_mock:
-        mock_notice = ('<p class="notice"><b>Offline mock run.</b> Extraction on text and PDF files is '
-                       'rule-based and the approver and critic give canned answers. The structure and '
-                       'rules shown here are real; the model reasoning is not.</p>')
-    dup_note = (f" Includes {_plural(len(dupes), 'duplicate copy').replace('copys', 'copies')} "
-                f"({money(dupe_total)}) of invoices already processed." if dupes else "")
+    mock = ('<p class="ap-notice"><span class="ap-tone-review" style="display: inline-flex"><span class="ap-glyph '
+            'ap-glyph--diamond" aria-hidden="true"></span></span>Offline mock run: model reasoning is canned</p>'
+            if is_mock else "")
+    templates = "".join(f'<template id="d-{v.key}">{_detail(v)}</template>' for v in views)
+    templates += ('<template id="d-none"><div class="ap-dempty"><p>Select an invoice to see why it was held, '
+                  'the evidence, and the drafts.</p></div></template>')
+    search_results = (
+        '<section class="ap-section" data-results hidden aria-labelledby="ap-res-h"><div class="ap-section-h">'
+        '<h2 id="ap-res-h" class="ap-h2">Search results</h2><span class="ap-section-n" data-count></span></div>'
+        '<ul class="ap-rows is-results" data-ctx="results"></ul><p class="ap-empty" data-none hidden>No invoices '
+        'match “<span data-q></span>”. Try an invoice number, vendor, owner or flag code.</p></section>')
 
-    tiles = "".join([
-        _tile("Paid", _tile_money(s["paid_total"]), _plural(s["paid"]), "paid"),
-        _tile("Held for review", _tile_money(s["review_total"]), _plural(s["needs_review"]), "review"),
-        _tile("Rejected, not paid", _tile_money(s["rejected_total"]), _plural(s["rejected"]), "rejected"),
-        _tile("Model calls", str(s["llm_calls"]), f"{s['llm_calls_per_invoice']} per invoice"),
-        _tile("Average time", f"{s['avg_seconds_per_invoice']}s", "per invoice, end to end"),
-    ])
-    reject_blurb = ("Blocked, with the reasons recorded. "
-                    + (f"{_plural(drafts, 'invoice')} can be returned to the vendor for correction: a "
-                       "draft request is attached for an AP clerk to review." if drafts else
-                       "None are correctable by the vendor."))
-    money_total = sum(p[2] for p in money_parts)
-
-    body = f"""
-<main>
-<header class="top"><div><h1>AP queues: run {e(run_id)}</h1>
-<div class="sub">{e(generated.strftime('%Y-%m-%d %H:%M'))} · LLM: {e(provider_name)}
- · past-due checks as of {e(as_of)}</div></div>
-<button id="theme" type="button" aria-label="Toggle light or dark theme">Theme</button></header>
-{mock_notice}
-<section class="hero"><div class="hero-fig">{e(f"{s['straight_through_rate']:.0%}")}</div>
-<div class="hero-cap">of {n} invoices were resolved without a person: paid, or rejected on hard evidence.
-{_plural(s['needs_review'])} {'is' if s['needs_review'] == 1 else 'are'} waiting for a decision, with the
-reasons attached.</div></section>
-<div class="tiles">{tiles}</div>
-<section class="panel"><h2 style="margin-top:0">Where the money went</h2>
-{_stacked_bar('Billed amount by outcome', money_parts, money_total, 'dollars')}
-{_stacked_bar('Invoices by outcome', count_parts, n, 'invoices')}
-<p class="muted">Amounts are what was billed. A rejected invoice is money that was not paid.{e(dup_note)}</p></section>
-<div class="searchrow"><input id="search" type="search" placeholder="Search all queues by invoice, vendor, owner or flag"
-aria-label="Search all queues"><span id="shown" class="muted"></span></div>
-{_queue("review", "Needs review", "Waiting for a person. Resolve with python main.py --review. Each is routed to the role best placed to decide.", held, _by_owner(held) if held else "")}
-{_queue("paid", "Ready to pay", "Approved and paid. In this prototype payment is a mock call; in production this feeds the next payment run.", paid)}
-{_queue("rejected", "Rejected", reject_blurb, rejected)}
-<section class="panel about"><h2 style="margin-top:0">About this run</h2>
-<p><b>Model use.</b> {e(tokens)}</p>
-<p><b>How to read the numbers.</b> A clean invoice is approved and paid by code with no model call. The model
-reads messy text, weighs invoices that have flags, and writes the notes for held and rejected invoices. The
-policy floor can never be overridden by the model.</p>
-<p><b>Caution.</b> If this is the provided sample set, about half the invoices are deliberately bad, so
-these figures show that the controls work. They are not a savings estimate for a real invoice mix.</p>
-</section>
-</main><div id="tip" class="tip" role="presentation"></div>"""
+    body = (
+        f'<div class="ap" data-theme="system"><div class="ap-wrap no-sel">'
+        '<header class="ap-header"><div class="ap-heading"><h1 class="ap-h1">Invoice run</h1><p class="ap-meta">'
+        f'<span>Run <span class="ap-mono">{e(run_id)}</span></span><span class="ap-sep" aria-hidden="true">·</span>'
+        f'<span>{e(day(generated.date()))}</span><span class="ap-sep" aria-hidden="true">·</span>'
+        f'<span>Provider {e(provider_name)}</span><span class="ap-sep" aria-hidden="true">·</span>'
+        f'<span>Past due as of {e(day(as_of))}</span></p>{mock}</div><div class="ap-tools"><div class="ap-search">'
+        '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" '
+        'aria-hidden="true"><circle cx="7" cy="7" r="4.75"></circle><path d="M10.5 10.5L14 14"></path></svg>'
+        '<label class="ap-sr" for="ap-q">Search invoices</label><input id="ap-q" type="search" '
+        'placeholder="Search invoice, vendor, owner, flag" autocomplete="off"></div>'
+        '<button type="button" class="ap-btn" data-theme-btn aria-label="Theme: System. Switch theme">'
+        '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" '
+        'aria-hidden="true"><circle cx="8" cy="8" r="6"></circle><path d="M8 2a6 6 0 0 0 0 12z" fill="currentColor">'
+        '</path></svg><span>System</span></button></div></header>'
+        '<p class="ap-sr" aria-live="polite" data-live></p>'
+        '<noscript><p class="ap-notice">This report needs JavaScript to open invoice details.</p></noscript>'
+        f'{_summary(views, results, held, paid, rejected)}'
+        '<div class="ap-main"><div class="ap-list">'
+        f'{search_results}{_review_section(held)}{_rejected_section(rejected)}{_paid_section(paid)}</div>'
+        '<aside class="ap-detail" aria-label="Invoice detail"></aside></div>'
+        f'{_about(results, provider_name)}{templates}</div></div>')
+    css = (ASSETS / "report.css").read_text(encoding="utf-8")
+    js = (ASSETS / "report.js").read_text(encoding="utf-8")
     return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f'<title>AP queues report</title><style>{CSS}</style></head><body>{body}'
-            f'<script>{JS}</script></body></html>')
+            f'<title>Invoice run {e(run_id)}</title><style>body{{margin:0}}\n{css}</style></head>'
+            f'<body>{body}<script>{js}</script></body></html>')
 
 
-def write_report(path: Path, results: list[Result], run_id: str, provider_name: str,
-                 is_mock: bool, as_of: dt.date) -> Path:
+def write_report(path: Path, results: list, run_id: str, provider_name: str, is_mock: bool,
+                 as_of: dt.date) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(build_report(results, run_id, provider_name, is_mock, as_of), encoding="utf-8")
     return path

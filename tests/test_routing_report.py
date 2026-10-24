@@ -124,31 +124,54 @@ def test_drafts_are_written_to_files_with_a_recipient(conn, tmp_path):
 # --- the HTML report -------------------------------------------------------------
 
 
+def _run(conn, names, provider=None):
+    provider = provider or MockProvider()
+    return [process_file(INVOICE_DIR / n, conn, provider, run_id="rep") for n in names]
+
+
 @pytest.fixture(scope="module")
 def sample_run():
     from invoice_ap.db import init_db
 
     conn = init_db(":memory:")
-    provider = MockProvider()
-    names = ["invoice_1001.txt", "invoice_1002.txt", "invoice_1004.json", "invoice_1004_revised.json",
-             "invoice_1010.txt", "invoice_1014.xml", "invoice_1016.json"]
-    return [process_file(INVOICE_DIR / n, conn, provider, run_id="rep") for n in names]
+    names = ["invoice_1001.txt", "invoice_1002.txt", "invoice_1003.txt", "invoice_1004.json",
+             "invoice_1004_revised.json", "invoice_1008.txt", "invoice_1009.json", "invoice_1010.txt",
+             "invoice_1011.pdf", "invoice_1011.txt", "invoice_1014.xml", "invoice_1016.json"]
+    return _run(conn, names)
 
 
-def test_the_report_has_the_three_queues_and_the_numbers(sample_run):
+def test_the_report_has_the_queues_the_groups_and_the_numbers(sample_run):
     html = build_report(sample_run, "rep", "mock", True, SETTINGS.as_of_date)
-    for heading in ("Needs review", "Ready to pay", "Rejected", "Where the money went"):
-        assert heading in html
-    assert "Suggested owner" in html and "Treasury" in html and "Buyer" in html
-    assert "Offline mock run" in html
-    assert "Correction request for the vendor" in html
+    for text in ("Invoice run", "to review", "Needs review", "Ready to pay", "Rejected",
+                 "Blocked: possible fraud", "Fixable by vendor", "Duplicates", "Invalid, not correctable",
+                 "Offline mock run: model reasoning is canned", "Draft: correction request to vendor",
+                 "Suggested owner", "Possible fraud."):
+        assert text in html, text
+
+
+def test_rejections_are_grouped_by_what_can_be_done_about_them(sample_run):
+    from invoice_ap.html_report import _view
+
+    groups = {r.file: _view(i, r).group for i, r in enumerate(sample_run)
+              if r.outcome == Outcome.REJECTED}
+    assert groups["invoice_1002.txt"] == "fix"        # stock shortfall: the vendor can correct it
+    assert groups["invoice_1003.txt"] == "fraud"      # pressure language and an unknown vendor
+    assert groups["invoice_1008.txt"] == "fraud"      # unknown vendor
+    assert groups["invoice_1009.json"] == "other"     # negative totals, no vendor to write to
+    assert groups["invoice_1011.txt"] == "dup"
 
 
 def test_the_report_is_self_contained(sample_run):
     html = build_report(sample_run, "rep", "mock", True, SETTINGS.as_of_date)
-    assert not re.search(r"https?://", html)                     # no network, no CDN
-    assert not re.search(r'<(link|img|iframe)\b', html)          # no external resources
+    assert not re.search(r"https?://", html)                          # no network, no CDN
+    assert not re.search(r"<(link|img|iframe|object|embed)\b", html)  # no external resources
     assert html.count("<script>") == 1 and "src=" not in html
+
+
+def test_every_invoice_has_a_detail_template_and_a_queue_row(sample_run):
+    html = build_report(sample_run, "rep", "mock", True, SETTINGS.as_of_date)
+    assert html.count('<template id="d-i') == len(sample_run)
+    assert html.count('class="ap-row-item"') == len(sample_run)
 
 
 def test_everything_from_an_invoice_is_escaped(conn, tmp_path):
@@ -158,27 +181,47 @@ def test_everything_from_an_invoice_is_escaped(conn, tmp_path):
         "invoice_number": "INV-6666", "vendor": {"name": payload}, "date": "2026-01-20",
         "due_date": "2026-02-20", "currency": "USD", "payment_terms": "Net 30",
         "line_items": [{"item": "<script>alert(2)</script>", "quantity": 1, "unit_price": 5.0,
-                        "note": "</details><b>x</b>"}],
+                        "note": "</template><b>x</b>"}],
         "subtotal": 5.0, "tax_amount": 0.0, "total": 5.0, "notes": "<script>alert(3)</script>"}))
     result = process_file(evil, conn, MockProvider(), run_id="x")
     html = build_report([result], "x", "mock", True, SETTINGS.as_of_date)
-    for raw in (payload, "<script>alert(2)", "<script>alert(3)", "</details><b>x</b>"):
+    for raw in (payload, "<script>alert(2)", "<script>alert(3)", "</template><b>x</b>"):
         assert raw not in html
     assert "&lt;img src=x onerror=alert(1)&gt;" in html
+    assert html.count("<script>") == 1  # the report's own script, and nothing injected
 
 
-def test_the_report_marks_operational_warnings(conn):
+def test_the_report_marks_operational_warnings_and_names_a_live_provider(conn):
     result = process_file(INVOICE_DIR / "invoice_1001.txt", conn, MockProvider(), run_id="x")
     result.warnings.append("approval model unavailable (HTTP 403)")
     html = build_report([result], "x", "grok", False, SETTINGS.as_of_date)
     assert "approval model unavailable" in html and "Offline mock run" not in html
+    assert "Provider grok" in html
 
 
-def test_an_empty_queue_says_so(conn):
-    result = process_file(INVOICE_DIR / "invoice_1001.txt", conn, MockProvider(), run_id="x")
-    html = build_report([result], "x", "mock", True, SETTINGS.as_of_date)
-    assert "Nothing is waiting for a person" not in html  # the queue panel says "Nothing here."
-    assert html.count("Nothing here.") == 2
+def test_a_run_with_nothing_held_says_so(conn):
+    html = build_report(_run(conn, ["invoice_1001.txt"]), "x", "mock", True, SETTINGS.as_of_date)
+    assert "Nothing to review" in html and "Nothing is waiting for a person" in html
+    assert "No fraud flags in this run." in html
+
+
+def test_a_large_run_builds_quickly_and_stays_a_reasonable_size(conn, tmp_path):
+    import time
+
+    for i in range(150):
+        (tmp_path / f"inv{i}.json").write_text(json.dumps({
+            "invoice_number": f"INV-{7000 + i}", "vendor": {"name": f"Brand New Vendor {i}"},
+            "date": "2026-01-20", "due_date": "2026-02-20", "currency": "USD", "payment_terms": "Net 30",
+            "line_items": [{"item": "SteelBracket", "quantity": 10 + i % 7, "unit_price": 45.0}],
+            "subtotal": 45.0 * (10 + i % 7), "tax_amount": 0.0, "total": 45.0 * (10 + i % 7)}))
+    results = [process_file(p, conn, MockProvider(), run_id="big") for p in sorted(tmp_path.glob("*.json"))]
+    started = time.perf_counter()
+    html = build_report(results, "big", "mock", True, SETTINGS.as_of_date)
+    assert time.perf_counter() - started < 2.0
+    assert len(html) < 8_000_000
+    held_rows = re.findall(r'<li class="ap-row-item" data-key="i\d+" data-owner="Vendor management"', html)
+    assert len(held_rows) == 150  # all held: unknown vendors
+    assert "data-more" in html  # the "Show N more" control exists for lists over 12
 
 
 def test_write_report_creates_the_file(sample_run, tmp_path):

@@ -5,3 +5,4 @@ __pycache__/
 .env
 runs/
 *.db
+.DS_Store

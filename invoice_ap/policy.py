@@ -25,6 +25,14 @@ FORCE_ESCALATE = {
     "NON_SETTLEABLE_CURRENCY": "Treasury must book an FX rate",
 }
 
+# The subset of FORCE_ESCALATE that points at deception or pressure rather than a
+# paperwork question. A rejected invoice carrying one of these is grouped as
+# "possible fraud" in the report, and no vendor draft is written for it.
+FRAUD_SIGNALS = {
+    "PRESSURE_LANGUAGE", "IMMEDIATE_TERMS", "RELATIVE_DUE_DATE", "DUE_BEFORE_ISSUE",
+    "UNKNOWN_VENDOR", "INVOICE_NUMBER_COLLISION", "POSSIBLE_REBILL",
+}
+
 _CAUTION = {Decision.APPROVE: 0, Decision.ESCALATE: 1, Decision.REJECT: 2}
 
 

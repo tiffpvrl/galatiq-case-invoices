@@ -84,7 +84,7 @@ An LLM is used only where the step needs to interpret ambiguity or reason in lan
 | Suggested owner | Code | A lookup from reason code to role (Treasury for FX, Buyer for price disputes, Controller for fraud signals, VP or CFO by amount). The most senior applicable role wins. A suggestion, not an access control |
 | Notification drafts | **LLM agent** for held and rejected invoices; template for paid | Turns structured reasons into a clear message for the owner. A paid invoice has nothing to explain, so it costs no model call. Drafts are saved, never sent |
 | Vendor correction request | Code (template) | Only when every hard-fail reason is one the vendor can fix and no identity or pressure flag is present. A template promises nothing we did not check; an AP clerk reviews before anything is sent |
-| AP queues report | Code | A static, self-contained HTML snapshot of the three queues for the people who work them. All invoice text is escaped |
+| AP queues report | Code | A static, self-contained HTML snapshot for the people who work the queues: a summary, then needs-review first with owner filters, rejections grouped by what can be done about them, and a detail panel per invoice. Markup is generated from run data and all invoice text is escaped; a small script handles selection, filtering and search |
 | Review queue and insights | Code and a person | The human decision is recorded; insights turn those decisions into suggested policy changes, never applied automatically |
 
 Safety properties:
