@@ -64,7 +64,7 @@ I tested the system using Claude, since that was the API available to me. It is 
 
 Other useful flags: `--json` (machine-readable), `--brief` (one line per invoice), `--offline` (force the mock), `--provider grok|custom|mock`, `--reserve-stock`, `--as-of YYYY-MM-DD`, `-v` (structured trace to stderr), `--open` (open the HTML report), `--no-report`. Each run writes `runs/<run-id>/report.html`, a JSON-lines trace, and the notification drafts (nothing is ever sent).
 
-The SQLite inventory is created and seeded automatically on first run. The four starter rows from the brief are unchanged; three extra SKUs let a clean invoice over $10K exist for testing.
+The SQLite inventory is created and seeded automatically on first run. The four starter rows from the brief are unchanged; three extra SKUs let a clean invoice over $10K exist for testing. As the brief invites, the seed data is extended: `inventory` gains `unit_price` (for price checks), and new tables hold approved vendors and their former names, the processed-invoice ledger, payments and reviewer decisions. Inventory is keyed by item only, so it records how much of an item is on hand, not which vendor delivered it.
 
 ## How it works
 
@@ -242,7 +242,8 @@ Invoice text is escaped because it is untrusted, and the interactions are tested
 
 ## Limitations and next steps
 
-- **Paying doesn't decrement stock,** so two invoices can each pass against the same received goods. `--reserve-stock` exposes this using the ledger; a production system would keep a ledger of matched quantities.
+- **Paying doesn't decrement stock,** so two invoices can each pass against the same received goods. This is deliberate. `--reserve-stock` treats each paid invoice as consuming stock, and on the sample set it cuts paid invoices from 5 to 2: with only 15 WidgetA on hand, 1006, 1011 and 1015 are rejected as stock contention, although the brief treats them as valid. Without PO or receipt numbers the system can't tell a second shipment from a double claim, so the option stays opt-in. A production system would match invoices to receipts and keep a ledger of matched quantities. A softer alternative is to raise contention as a flag for review rather than a rejection.
+- **Line notes are read by the model, not by the rules.** Notes such as "Volume discount", "Replacement", "Sample" and "Expedited" (INV-1013) appear in the report and in the approver's evidence, but the deterministic price and stock checks ignore them, so a discounted line can look like a price deviation. It would be interesting to survey the range of notes real invoices carry and how they separate legitimate adjustments from fraud, for example a "sample" line billed at full price.
 - **Split billing is partly covered.** The approver can check a vendor's recent invoices, but there is no deterministic cross-invoice rule, and the sample data only exercises it through one constructed case.
 - **No FX.** Non-USD invoices are escalated, not converted.
 - **The rule-based text extractor was tuned on the ten sample text and PDF files.** On live runs the LLM matched it on every core field, but unseen layouts are the LLM's job and weren't tested on a wider variety.

@@ -374,14 +374,30 @@ def _lines_html(v: View) -> str:
         f'<span role="cell" class="ap-note">{e(li.note)}</span></div>' for li in inv.line_items)
     if not rows:
         return '<p class="ap-muted">No line items were found.</p>'
+    extra = _summary_row("Subtotal (stated)", inv.subtotal) + _summary_row("Tax", inv.tax) \
+        + _summary_row("Shipping", inv.shipping)
+    lines = [li.amount if li.amount is not None else (li.quantity * li.unit_price if li.unit_price is not None else None)
+             for li in inv.line_items]
+    if inv.total is not None and None not in lines:
+        expected = sum(lines) + (inv.tax or 0) + (inv.shipping or 0)
+        if abs(expected - inv.total) > 0.01:
+            extra += _summary_row("Lines + tax + shipping", expected, "Computed from the lines above")
     return (f'<div class="ap-tablebox"><div class="ap-gt ap-gt--lines" role="table" '
             f'aria-label="Line items for {e(v.number)}"><div role="row"><span role="columnheader">Item</span>'
             '<span role="columnheader" class="num">Qty</span><span role="columnheader" class="num">Unit price'
             '</span><span role="columnheader" class="num">Amount</span><span role="columnheader">Note</span>'
-            f'</div>{rows}<div role="row"><span role="rowheader" class="is-total">Invoice total</span>'
+            f'</div>{rows}{extra}<div role="row"><span role="rowheader" class="is-total">Invoice total (stated)</span>'
             '<span role="cell" class="is-total"></span><span role="cell" class="is-total"></span>'
             f'<span role="cell" class="num is-total">{e(money(inv.total, True))}</span>'
             '<span role="cell" class="is-total"></span></div></div></div>')
+
+
+def _summary_row(label: str, value, note: str = "") -> str:
+    if value is None:
+        return ""
+    return (f'<div role="row"><span role="rowheader">{e(label)}</span><span role="cell"></span>'
+            f'<span role="cell"></span><span role="cell" class="num">{e(money(value, True))}</span>'
+            f'<span role="cell" class="ap-note">{e(note)}</span></div>')
 
 
 def _facts(v: View) -> list:
